@@ -139,6 +139,28 @@ step('a new machine joins with a pairing code, another with a key file', async (
   }
 });
 
+if (process.env.REACH_BIN)
+  step('a personal copy of the executable joins by itself', async () => {
+    const dir = path.join(tmp, 'personal');
+    fs.mkdirSync(dir);
+    const made = spawn(path.resolve(process.env.REACH_BIN), ['personal'], { cwd: dir, env: { ...process.env, REACH_HOME: home }, stdio: 'ignore' });
+    await new Promise((r) => made.on('close', r));
+    const exe = path.join(dir, 'my-' + path.basename(process.env.REACH_BIN));
+    assert.ok(fs.existsSync(exe), 'personal copy written');
+    const run = spawn(exe, ['--no-qr', '--name', 'personal box'], { cwd: dir, env: { ...process.env, REACH_HOME: path.join(tmp, 'home4') }, stdio: 'ignore' });
+    try {
+      await until(() => machines.some((m) => m.online && m.name === 'personal box'), 'personal copy online', 30000);
+      const box = machines.find((m) => m.name === 'personal box');
+      const { r } = await ctl.call(box.id, 'exec', { cmd: 'echo from-personal', cwd: work });
+      let text = '';
+      const stop = ctl.watchJob(box.id, r.job, (h, b) => h.y === 'out' && (text += Buffer.from(b).toString()));
+      await until(() => /from-personal/.test(text), 'command output from the personal copy');
+      stop();
+    } finally {
+      run.kill();
+    }
+  });
+
 step('a different key sees nothing and cannot command the machine', async () => {
   let seen = [];
   const other = new Controller({ mqttConnect: mqtt.connect, key: newKey(), onMachines: (m) => (seen = m) });

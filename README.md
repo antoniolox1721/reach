@@ -23,7 +23,17 @@ If you have Node.js 18+ and git you can skip the download and use `npx github:an
 
 **2. First machine.** Start the program (double-click it on Windows). It says the machine is not on a dashboard yet. Press **Enter** to create your dashboard. It prints a **dashboard link** and a QR code. Open the link, or scan the QR code with your phone, and choose a **password** for that device. Your machine is in the list.
 
-**3. Every other machine.** Start the program. It shows a **code** like `ABCD-EFGH-JKLM`. In your dashboard choose **Add a machine**, type the code and confirm (or scan the QR code the new machine shows with the phone that already has your dashboard). The machine appears in the list a few seconds later. It does not matter which network each machine is on.
+**3. Make your personal copy.** On that first machine, open a terminal in any other folder and run the program with the word `personal`:
+
+```
+C:\Users\you\Downloads\reach-windows-x64.exe personal
+```
+
+It writes `my-reach-windows-x64.exe` in the current folder: the same program with your key stamped into it. **Run that file on any computer and it is on your dashboard a few seconds later**, with no code and no question, whatever network it is on. Keep it on a USB stick or in your private cloud storage. To stamp a program for a different system, pass its file: `reach personal reach-linux-x64` (Mac programs cannot be stamped; use a key file there).
+
+That file is your master key. Anyone who gets it can control every machine of yours, so never upload it publicly or leave it on a computer that is not yours. If it leaks, run `reach rekey` and make a new one.
+
+**Without a personal copy.** Start the plain program on the new machine. It shows a **code** like `ABCD-EFGH-JKLM`. In your dashboard choose **Add a machine**, type the code and confirm (or scan the QR code the new machine shows with the phone that already has your dashboard). The machine appears in the list a few seconds later. It does not matter which network each machine is on.
 
 Leave the program running on a machine for as long as you want to reach it. It remembers its key in `~/.reach/config.json`, so next time you just start it.
 
@@ -57,6 +67,7 @@ iPhones can use the dashboard but cannot run the program.
 reach                 put this machine online (first run: shows a pairing code for your dashboard)
 reach new             first machine: create a new key and dashboard
 reach join <key>      add this machine using the key (or dashboard link) from another one
+reach personal [file] make a personal copy of the program (or of a downloaded one) that joins by itself
 reach keyfile         write reach.key here; reach started next to that file offers to join with it
 reach link            show the dashboard link, QR code and join command again
 reach ui [port]       serve the dashboard from this machine instead of the public page
@@ -86,7 +97,7 @@ Anyone who controls reach can read your files and run commands, so this is the p
 
 What you need to do:
 
-- Treat the key, the dashboard link, the join command and any `reach.key` file like a master password. Do not paste them into chats or screenshots.
+- Treat the key, the dashboard link, the join command, your personal copy (`my-reach-...`) and any `reach.key` file like a master password. Do not paste them into chats or screenshots.
 - Only approve a pairing code that you can see on a machine you started yourself. Never approve a code or open a pairing link that someone sends you: approving gives that machine your key.
 - If a device is lost or the key may have leaked, run `reach rekey` on one machine and `reach join <new key>` on the others. The old key stops working as soon as no machine uses it.
 - The public dashboard is served from `antoniolox1721.github.io`. Whoever controls that GitHub repository controls the page's code. If you would rather not depend on that, run `reach ui` and use the dashboard from `http://127.0.0.1:7700`, or fork the repository and pass `--dashboard` with your own address.

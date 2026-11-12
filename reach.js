@@ -66,6 +66,7 @@ const HELP = `reach ${PKG.version} - control your machines from any of your mach
   reach                 put this machine online (first run: shows a pairing code for your dashboard)
   reach new             first machine: create a new key and dashboard
   reach join <key>      add this machine using the key (or dashboard link) from another one
+  reach personal [file] make a personal copy of the program (or of a downloaded one) that joins by itself
   reach keyfile         write reach.key here; reach started next to that file offers to join with it
   reach link            show the dashboard link, QR code and join command again
   reach ui [port]       serve the dashboard from this machine instead of the public page
@@ -506,6 +507,46 @@ function serveUi(cfg, port) {
 
 // ---------- first run: get the key ----------
 
+// ---------- personal copy: an executable with the key stamped onto its end ----------
+
+const STAMP = /\n#REACH-PERSONAL(#k=[A-Za-z0-9_%.~&=+:/\[\]@-]+)#END#\n$/;
+
+function readStamp(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const buf = Buffer.alloc(Math.min(size, 1024));
+    fs.readSync(fd, buf, 0, buf.length, size - buf.length);
+    const m = STAMP.exec(buf.toString('latin1'));
+    return m ? { link: m[1], length: Buffer.byteLength(m[0], 'latin1') } : null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// The key this executable was stamped with, if it is a personal copy.
+function stampedKey() {
+  if (!PACKED) return null;
+  const stamp = readStamp(process.execPath);
+  return stamp ? parseKeyInput(stamp.link) : null;
+}
+
+function makePersonal(cfg, source) {
+  if (!cfg.key) throw new Error('No key yet. Start reach once on this machine first.');
+  source = source || (PACKED ? process.execPath : null);
+  if (!source) throw new Error('Usage: reach personal <downloaded reach program>');
+  let data = fs.readFileSync(source);
+  if (data.readUInt32LE(0) === 0xfeedfacf) throw new Error('Mac programs cannot be stamped (it breaks their signature). On a Mac use "reach keyfile" instead.');
+  const old = readStamp(source);
+  if (old) data = data.subarray(0, data.length - old.length);
+  const link = '#' + new URLSearchParams({ k: cfg.key, ...(cfg.broker ? { b: cfg.broker } : {}) });
+  const out = path.resolve('my-' + path.basename(source).replace(/^my-/, ''));
+  if (out === path.resolve(source)) throw new Error('Run this from a different folder than the program itself.');
+  fs.writeFileSync(out, Buffer.concat([data, Buffer.from(`\n#REACH-PERSONAL${link}#END#\n`, 'latin1')]), { mode: 0o755 });
+  console.log(`Wrote ${out}\n\nRun that file on any of your machines and it joins your dashboard by itself.`);
+  console.log('It contains your key. Keep it to yourself: never upload it, share it or leave it on a machine that is not yours.');
+}
+
 const ask = (question) =>
   new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -594,6 +635,11 @@ async function main() {
   if (cfg.broker === DEFAULT_BROKER) set('broker', '');
   checkBroker(cfg.broker);
   if (cfg.key) parseKeyInput(cfg.key);
+  const stamped = cmd === 'up' ? stampedKey() : null;
+  if (stamped) {
+    set('key', stamped.key);
+    set('broker', stamped.broker);
+  }
   if (cmd === 'up' && !cfg.key) {
     const got = (await keyFileNextToProgram()) || (await pairOrCreate(cfg, flags));
     set('key', got.key);
@@ -602,6 +648,7 @@ async function main() {
   if (dirty) saveConfig(cfg);
 
   if (cmd === 'up' || cmd === 'join' || cmd === 'new') return runAgent(cfg, flags);
+  if (cmd === 'personal') return makePersonal(cfg, rest[1]);
   if (cmd === 'keyfile') {
     if (!cfg.key) throw new Error('No key yet. Run "reach" first.');
     const link = '#' + new URLSearchParams({ k: cfg.key, ...(cfg.broker ? { b: cfg.broker } : {}) });
