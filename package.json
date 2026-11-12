@@ -1,0 +1,22 @@
+{
+  "name": "reach",
+  "version": "0.1.0",
+  "description": "Run it on any machine and control it from any other: files, commands and saved scripts, end-to-end encrypted, no VPN or port forwarding.",
+  "type": "module",
+  "bin": {
+    "reach": "reach.js"
+  },
+  "scripts": {
+    "start": "node reach.js",
+    "test": "node test/e2e.js"
+  },
+  "homepage": "https://antoniolox1721.github.io/reach/",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "mqtt": "^5.16.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

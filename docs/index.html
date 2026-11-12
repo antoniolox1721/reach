@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src wss: ws:; worker-src blob:; base-uri 'none'; form-action 'none'">
+<meta name="theme-color" content="#0f1216">
+<title>reach</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <button id="back" class="icon" hidden aria-label="Back">&#8592;</button>
+  <h1 id="title">reach</h1>
+  <span id="status" class="dot" title="Relay connection"></span>
+  <button id="lock" class="ghost" hidden>Lock</button>
+</header>
+<main id="view"></main>
+<div id="transfers"></div>
+<div id="toasts"></div>
+<script src="mqtt.min.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
