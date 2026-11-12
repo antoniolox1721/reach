@@ -178,6 +178,35 @@ if (BIN)
     run.kill();
   });
 
+if (BIN)
+  step('kit: prepared dashboard and client program, key erased once the page has claimed it', async () => {
+    const dir = path.join(tmp, 'kit');
+    const kit = reach(['kit', dir, '--targets', (win ? 'windows' : 'linux') + '-' + process.arch], 'home5', { stdio: 'ignore' });
+    assert.equal(await new Promise((r) => kit.on('close', r)), 0);
+    const exe = fs.readdirSync(dir).map((f) => path.join(dir, f))[0];
+    assert.match(path.basename(exe), /^reach-client-/);
+    const port = PORT + 1;
+    reach(['--no-open', '--port', String(port), '--name', 'kit desktop'], 'home5', { stdio: 'ignore' });
+    const call = async (method, name) => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/${name}`, { method, headers: { 'x-reach': '1', 'content-type': 'application/json' }, body: method === 'POST' ? '{}' : undefined });
+      return { status: res.status, ...(await res.json()) };
+    };
+    await until(() => call('GET', 'status').then((s) => s.pending === true, () => false), 'prepared dashboard');
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/claim`, { method: 'POST' })).status, 403, 'other pages cannot take the key');
+    const { secret: kitSecret } = await call('POST', 'claim');
+    let list = [];
+    const kitCtl = new Controller({ mqttConnect: mqtt.connect, secret: kitSecret, onMachines: (m) => (list = m) });
+    await kitCtl.start();
+    const run = spawn(exe, ['--name', 'kit client'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home6') }, stdio: 'ignore' });
+    children.push(run);
+    await until(() => ['kit desktop', 'kit client'].every((n) => list.some((m) => m.online && m.name === n)), 'kit computer and kit client online');
+    kitCtl.stop();
+    await call('POST', 'claimed');
+    assert.equal((await call('GET', 'status')).pending, false);
+    assert.equal((await call('POST', 'claim')).status, 404);
+    assert.ok(!fs.readFileSync(path.join(tmp, 'home5', 'config.json'), 'utf8').includes(kitSecret), 'key erased from disk after claiming');
+  });
+
 step('knowing the dashboard address (what a client program holds) is not enough to control a machine', async () => {
   const base = await fleetBase(pub);
   const attacker = await newSecret();

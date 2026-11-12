@@ -55,7 +55,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--no-qr') flags.noQr = true;
     else if (a === '--no-open') flags.noOpen = true;
-    else if (a === '--name' || a === '--broker' || a === '--port') flags[a.slice(2)] = argv[++i];
+    else if (a === '--name' || a === '--broker' || a === '--port' || a === '--targets') flags[a.slice(2)] = argv[++i];
     else if (a === '-h' || a === '--help') flags.help = true;
     else rest.push(a);
   }
@@ -68,6 +68,8 @@ The dashboard program opens your password-protected dashboard. From there you do
 client programs. A client program only puts its machine on your dashboard.
 
   reach                 dashboard program: open the dashboard / client program: go online
+  reach kit [folder]    prepare everything: a new dashboard for this computer (you only choose the
+                        password) and client programs for Windows and Linux in the folder
   reach pair            show a one-time code to add this machine to a dashboard, then stay online
   reach client          stay online without opening the dashboard (after this machine was added)
   reach name <name>     rename this machine
@@ -574,7 +576,17 @@ function serveDashboard(cfg, port, state) {
     // Everything else changes this machine, so it must come from our own page (a custom header cannot be sent cross-site).
     if (req.headers['x-reach'] !== '1') return json(res, 403, { error: 'forbidden' });
     if (name === 'status' && req.method === 'GET') {
-      return json(res, 200, { name: cfg.name, os: osLabel(), version: PKG.version, target: ownTarget(), targets: TARGETS, enrolled: state.client?.dpub || '', pairCode: state.pairCode || '' });
+      return json(res, 200, { name: cfg.name, os: osLabel(), version: PKG.version, target: ownTarget(), targets: TARGETS, enrolled: state.client?.dpub || '', pairCode: state.pairCode || '', pending: !!cfg.pending, broker: cfg.broker || '' });
+    }
+    // A dashboard prepared by "reach kit" waits here until the page has locked it with the user's password.
+    if (name === 'claim' && req.method === 'POST') {
+      if (!cfg.pending) return json(res, 404, { error: 'No prepared dashboard is waiting.' });
+      return json(res, 200, { secret: cfg.pending, broker: cfg.broker || '' });
+    }
+    if (name === 'claimed' && req.method === 'POST') {
+      delete cfg.pending;
+      saveConfig(cfg);
+      return json(res, 200, { ok: true });
     }
     if (name === 'enroll' && req.method === 'POST') {
       const body = await readBody(req);
@@ -613,13 +625,34 @@ function openBrowser(url) {
   } catch {}
 }
 
+// ---------- kit: a prepared dashboard plus client programs for it ----------
+
+async function makeKit(cfg, folder, targets) {
+  for (const t of targets) if (!TARGETS.includes(t)) throw new Error(`Unknown system "${t}". Choose from: ${TARGETS.join(', ')}`);
+  // The new dashboard key waits in this computer's private config until the dashboard page locks it with a password.
+  if (!cfg.pending) cfg.pending = await newSecret();
+  const pub = publicOf(cfg.pending);
+  cfg.dpub = pub;
+  saveConfig(cfg);
+  fs.mkdirSync(folder, { recursive: true });
+  console.log('Dashboard prepared for this computer.\n');
+  for (const t of targets) {
+    const file = path.join(folder, `reach-client-${t}${t.startsWith('windows') ? '.exe' : ''}`);
+    process.stdout.write(`Making ${file} ... `);
+    fs.writeFileSync(file, stampClient(await programFor(t), pub, cfg.broker), { mode: 0o755 });
+    console.log('done');
+  }
+  console.log('\nNext:\n  1. Start the dashboard program on this computer and choose your password. This computer is added by itself.');
+  console.log('  2. Run a client program on any other computer. It appears on your dashboard by itself.');
+}
+
 // ---------- cli ----------
 
 async function main() {
   const { flags, rest } = parseArgs(process.argv.slice(2));
   const cmd = rest[0] || 'up';
   if (flags.help || cmd === 'help') return console.log(HELP);
-  if (!['up', 'pair', 'client', 'name'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
+  if (!['up', 'pair', 'client', 'name', 'kit'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
 
   const cfg = loadConfig();
   if (flags.name) cfg.name = flags.name;
@@ -640,6 +673,10 @@ async function main() {
   if (cfg.dpub) checkPublic(cfg.dpub);
   saveConfig(cfg);
   if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}".`);
+  if (cmd === 'kit') {
+    if (stamp) throw new Error('This is a client program. Use the dashboard program to make a kit.');
+    return makeKit(cfg, path.resolve(rest[1] || '.'), (flags.targets || 'windows-x64,linux-x64').split(','));
+  }
 
   const state = {
     client: null,

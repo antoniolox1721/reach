@@ -129,3 +129,4 @@ a.button { display: inline-block; background: var(--panel2); border: 1px solid v
 .bigcode { font-size: 26px; letter-spacing: 2px; margin: 14px 0; }
 canvas.qr { border-radius: 8px; max-width: 100%; height: auto; }
 .sheet.center button { text-align: center; }
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--accent); color: var(--accent); flex: none; }

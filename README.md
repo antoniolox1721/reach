@@ -29,6 +29,18 @@ On Linux and Mac make it runnable first: `chmod +x reach-dashboard-*`. The progr
 
 **5. Use it from your phone.** Under **Add a machine**, choose **Show QR code** and scan it with your phone. The phone opens the dashboard at <https://antoniolox1721.github.io/reach/> and asks you to choose a password for the phone. From then on that page is your dashboard on the phone.
 
+### Everything prepared in one go
+
+Instead of steps 2 to 4 you can let the program prepare a kit. In a terminal, in the folder where the dashboard program is:
+
+```
+reach-dashboard-windows-x64.exe kit
+```
+
+It creates your dashboard, adds this computer to it, and writes `reach-client-windows-x64.exe` and `reach-client-linux-x64` into the folder. Then start the dashboard program: it only asks you to choose your password, and this computer is already in the list. Run a client program on any other computer and it appears by itself.
+
+Until you have chosen the password, the new dashboard key sits unprotected in `~/.reach/config.json` on that computer, so start the dashboard program right after making the kit.
+
 ### Macs, Android phones and other machines
 
 Client programs cannot be made for Macs (stamping breaks their signature) or phones. Those join with a one-time code instead:
@@ -61,6 +73,7 @@ Double-clicking is enough. From a terminal:
 
 ```
 reach                 dashboard program: open the dashboard / client program: go online
+reach kit [folder]    prepare a new dashboard for this computer plus Windows and Linux client programs
 reach pair            show a one-time code to add this machine to a dashboard, then stay online
 reach client          stay online without opening the dashboard (after this machine was added)
 reach name <name>     rename this machine
@@ -91,7 +104,7 @@ What you need to do:
 - Choose a good password. It is all that stands between someone using your computer or phone and all your machines.
 - The **phone QR code contains the dashboard key**. Show it only to your own phone. Anyone who photographs it has full access.
 - Run client programs only on machines you are happy to have on your dashboard, and only client programs you downloaded from your own dashboard: a machine obeys whichever dashboard its client program belongs to.
-- A leaked client file lets a stranger make *their* machine show up in your list (they still cannot control anything). Do not open machines you do not recognise.
+- A leaked client file lets a stranger make *their* machine show up in your list (they still cannot control anything). Machines you have not opened before on a device are marked **new** and ask before opening: do not open ones you do not recognise.
 - If the dashboard key may have leaked (lost phone with a weak password, photographed QR code), choose *Forget this device* on every device, create a new dashboard, and download new client programs for your machines. A machine switches dashboards when you run a new client program on it.
 - The public page is served from this GitHub repository. If you would rather not depend on that for your phone, fork the repository and host the `docs/` folder yourself.
 

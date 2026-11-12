@@ -184,16 +184,18 @@ function showUnlock() {
 }
 
 // mode 'create': new dashboard. mode 'import': an existing dashboard's key, typed or from a link.
+// mode 'claim': a dashboard that "reach kit" prepared on this computer; only the password is missing.
 function showSetup(mode = 'create', fromLink = null) {
   screen = 'setup';
   setHeader('reach', false);
   const hadVault = !!localStorage.getItem(VAULT);
+  const claiming = mode === 'claim';
   const importing = mode === 'import';
   const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Dashboard link or key' });
   const pw1 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters' });
   const pw2 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'Repeat the password' });
   const msg = h('p', { class: 'error' });
-  const go = h('button', { class: 'primary', type: 'submit' }, importing ? 'Save and open' : 'Create my dashboard');
+  const go = h('button', { class: 'primary', type: 'submit' }, claiming ? 'Open my dashboard' : importing ? 'Save and open' : 'Create my dashboard');
   const form = h(
     'form',
     {
@@ -207,8 +209,15 @@ function showSetup(mode = 'create', fromLink = null) {
           if (pw1.value.length < 8) throw new Error('Use a password of at least 8 characters.');
           if (pw1.value !== pw2.value) throw new Error('The two passwords do not match.');
           go.disabled = true;
-          const s = parsed ? { key: parsed.secret, broker: parsed.broker } : { key: await newSecret(), broker: '' };
+          let s;
+          if (claiming) {
+            const prepared = parseLink('#' + new URLSearchParams({ k: (await api('claim', {})).secret }));
+            s = { key: prepared.secret, broker: local.broker || '' };
+          } else s = parsed ? { key: parsed.secret, broker: parsed.broker } : { key: await newSecret(), broker: '' };
           await saveVault(pw1.value, s);
+          // Only now that the key is locked with the password does the program erase its unprotected copy.
+          if (claiming) await api('claimed', {});
+          await refreshLocal();
           await connect(s);
         } catch (err) {
           msg.textContent = err.message;
@@ -221,7 +230,10 @@ function showSetup(mode = 'create', fromLink = null) {
       { class: 'card' },
       importing
         ? h('p', null, fromLink ? 'Dashboard key received from the link. Only continue if you made this link yourself, on your own dashboard.' : 'Paste the link or key of your existing dashboard.')
-        : h('p', null, 'Create your dashboard. It is protected by a password that you type each time you open it.'),
+        : claiming
+          ? h('p', null, 'Your dashboard is ready. Choose the password that protects it. You type it each time you open the dashboard.')
+          : h('p', null, 'Create your dashboard. It is protected by a password that you type each time you open it.'),
+      claiming && hadVault && h('p', { class: 'error' }, 'This browser already has a dashboard. Continuing replaces it with the newly prepared one.'),
       fromLink && hadVault && h('p', { class: 'error' }, 'This device already has a dashboard. Continuing replaces it with the one from the link.'),
       fromLink?.broker && h('p', { class: 'small' }, 'This link uses a custom relay: ', h('code', null, fromLink.broker)),
       importing && !fromLink && h('label', null, 'Dashboard link or key'),
@@ -231,10 +243,10 @@ function showSetup(mode = 'create', fromLink = null) {
       h('label', null, 'Repeat password'),
       pw2,
       msg,
-      h('div', { class: 'row' }, go, fromLink && hadVault && h('button', { type: 'button', onclick: showUnlock }, 'Keep my dashboard'))
+      h('div', { class: 'row' }, go, (fromLink || claiming) && hadVault && h('button', { type: 'button', onclick: showUnlock }, 'Keep my dashboard'))
     ),
-    !fromLink && h('p', null, h('button', { class: 'ghost small', type: 'button', onclick: () => showSetup(importing ? 'create' : 'import') }, importing ? 'Create a new dashboard instead' : 'I already have a dashboard on another device')),
-    !fromLink && local && h('p', null, h('button', { class: 'ghost small', type: 'button', onclick: () => showPairHere().catch(fail) }, 'Only add this computer to a dashboard I have elsewhere')),
+    !fromLink && !claiming && h('p', null, h('button', { class: 'ghost small', type: 'button', onclick: () => showSetup(importing ? 'create' : 'import') }, importing ? 'Create a new dashboard instead' : 'I already have a dashboard on another device')),
+    !fromLink && !claiming && local && h('p', null, h('button', { class: 'ghost small', type: 'button', onclick: () => showPairHere().catch(fail) }, 'Only add this computer to a dashboard I have elsewhere')),
     h('p', { class: 'dim small' }, 'Your dashboard key is stored on this device only, locked with your password. Client programs never contain it.')
   );
   view.replaceChildren(form);
@@ -306,17 +318,29 @@ async function addMachine(input) {
 
 // ---------- machine list ----------
 
+// Machines this device has opened before. Anything else is flagged, since a copied client program lets
+// someone else's machine show up here (it cannot control anything, but you should not trust its files).
+const seenMachines = () => {
+  try {
+    return new Set(JSON.parse(localStorage.getItem('reach.seen') || '[]'));
+  } catch {
+    return new Set();
+  }
+};
+
 let adding = false; // whether the "Add a machine" panel is open
 const cardList = h('div');
 
 // Redraws only the machine cards, so presence updates never disturb what the user is typing below them.
 function drawCards() {
+  const seen = seenMachines();
   const cards = machines.map((m) =>
     h(
       'button',
       { class: 'card machine' + (m.online ? '' : ' offline'), onclick: () => openMachine(m) },
       h('span', { class: 'dot ' + (m.online ? 'on' : 'off') }),
-      h('span', { class: 'grow' }, h('div', { class: 'name' }, m.name), h('div', { class: 'dim small' }, m.os + (m.host && m.host !== m.name ? ' · ' + m.host : '') + (m.online ? '' : ' · offline')))
+      h('span', { class: 'grow' }, h('div', { class: 'name' }, m.name), h('div', { class: 'dim small' }, m.os + (m.host && m.host !== m.name ? ' · ' + m.host : '') + (m.online ? '' : ' · offline'))),
+      !seen.has(m.id) && h('span', { class: 'badge', title: 'You have not opened this machine on this device before' }, 'new')
     )
   );
   cardList.replaceChildren(...(cards.length ? cards : [h('div', { class: 'empty' }, 'No machines yet. Choose "Add a machine" below.')]));
@@ -420,7 +444,10 @@ function showPhoneLink() {
 
 async function openMachine(m) {
   try {
+    const seen = seenMachines();
+    if (!seen.has(m.id) && seen.size && !confirm(`"${m.name}" is new on this dashboard. Open it only if it is a machine you added yourself.`)) return;
     const info = await ctl.info(m.id);
+    localStorage.setItem('reach.seen', JSON.stringify([...seen.add(m.id)]));
     current = { id: m.id, name: m.name, info, tab: 'files', files: { path: info.home }, term: newTerm(info.home) };
     history.pushState({ machine: m.id }, '');
     showMachine();
@@ -995,6 +1022,7 @@ async function boot() {
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);
   await refreshLocal();
   if (fromLink?.secret) showSetup('import', fromLink);
+  else if (local?.pending) showSetup('claim');
   else if (localStorage.getItem(VAULT)) showUnlock();
   else {
     if (pendingPair) toast('Open your dashboard on this device first, then scan the code again.', true);
