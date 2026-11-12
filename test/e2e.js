@@ -131,7 +131,7 @@ step('a new machine joins with a pairing code, another with a key file', async (
   const dir3 = path.join(tmp, 'usb');
   fs.mkdirSync(dir3);
   fs.writeFileSync(path.join(dir3, 'reach.key'), '#k=' + ctl.key + '\n');
-  const third = reach(['--no-qr', '--name', 'keyfile box'], { cwd: dir3, env: { ...process.env, REACH_HOME: path.join(tmp, 'home3') }, stdio: 'ignore' });
+  const third = reach(['join', path.join(dir3, 'reach.key'), '--no-qr', '--name', 'keyfile box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home3') }, stdio: 'ignore' });
   try {
     await until(() => machines.some((m) => m.online && m.name === 'keyfile box'), 'key file machine online', 30000);
   } finally {

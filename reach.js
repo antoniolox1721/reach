@@ -66,7 +66,7 @@ const HELP = `reach ${PKG.version} - control your machines from any of your mach
   reach                 put this machine online (first run: shows a pairing code for your dashboard)
   reach new             first machine: create a new key and dashboard
   reach join <key>      add this machine using the key (or dashboard link) from another one
-  reach keyfile         write reach.key here; a copy of reach started next to that file joins by itself
+  reach keyfile         write reach.key here; reach started next to that file offers to join with it
   reach link            show the dashboard link, QR code and join command again
   reach ui [port]       serve the dashboard from this machine instead of the public page
   reach name <name>     rename this machine
@@ -506,16 +506,30 @@ function serveUi(cfg, port) {
 
 // ---------- first run: get the key ----------
 
-// A reach.key file next to the program (or in the current folder) lets a copied program join by itself.
-function readKeyFile() {
-  for (const dir of new Set([ROOT, process.cwd()])) {
-    try {
-      return parseKeyInput(fs.readFileSync(path.join(dir, KEYFILE), 'utf8'));
-    } catch (e) {
-      if (e.code !== 'ENOENT') throw new Error(`${path.join(dir, KEYFILE)}: ${e.message}`);
-    }
+const ask = (question) =>
+  new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => (rl.close(), resolve(answer.trim())));
+  });
+
+// A reach.key file next to the program lets a copy carried on a USB stick join without a pairing code.
+// It is never used silently: a planted file would otherwise enrol this machine in someone else's dashboard.
+async function keyFileNextToProgram() {
+  const file = path.join(ROOT, KEYFILE);
+  let got;
+  try {
+    got = parseKeyInput(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw new Error(`${file}: ${e.message}`);
   }
-  return null;
+  if (!process.stdin.isTTY) {
+    console.log(`Ignoring ${file}: nobody is here to confirm it. Use "reach join ${file}" to use it on purpose.`);
+    return null;
+  }
+  console.log(`\nFound a key file: ${file}` + (got.broker ? `\nIt uses the relay ${got.broker}` : ''));
+  console.log('Whoever made that file will be able to read files and run commands on this machine.');
+  return /^y(es)?$/i.test(await ask('Did you put it there yourself, and do you want to join that dashboard? [y/N] ')) ? got : null;
 }
 
 // Shows a one-time code and waits for a dashboard to approve it. Enter creates a new dashboard instead.
@@ -562,7 +576,9 @@ async function main() {
   if (!cfg.name) set('name', os.hostname());
 
   if (cmd === 'join') {
-    const { key, broker } = parseKeyInput(rest[1]);
+    // The argument is a key, a dashboard link, or the path of a reach.key file.
+    const isFile = rest[1] && fs.existsSync(rest[1]) && fs.statSync(rest[1]).isFile();
+    const { key, broker } = parseKeyInput(isFile ? fs.readFileSync(rest[1], 'utf8') : rest[1]);
     await deriveKeys(key);
     set('key', key);
     if (broker) set('broker', broker);
@@ -579,7 +595,7 @@ async function main() {
   checkBroker(cfg.broker);
   if (cfg.key) parseKeyInput(cfg.key);
   if (cmd === 'up' && !cfg.key) {
-    const got = readKeyFile() || (await pairOrCreate(cfg, flags));
+    const got = (await keyFileNextToProgram()) || (await pairOrCreate(cfg, flags));
     set('key', got.key);
     if (got.broker) set('broker', got.broker);
   }
@@ -590,7 +606,7 @@ async function main() {
     if (!cfg.key) throw new Error('No key yet. Run "reach" first.');
     const link = '#' + new URLSearchParams({ k: cfg.key, ...(cfg.broker ? { b: cfg.broker } : {}) });
     fs.writeFileSync(KEYFILE, link + '\n', { mode: 0o600 });
-    return console.log(`Wrote ${path.resolve(KEYFILE)}. Keep it secret. Put it in the same folder as the reach program on another machine and start it.`);
+    return console.log(`Wrote ${path.resolve(KEYFILE)}. Keep it secret. Put it in the same folder as the reach program on another machine and start it, or run \"reach join <that file>\".`);
   }
   if (cmd === 'ui') return serveUi(cfg, Number(rest[1]) || 7700);
   if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}". Restart reach to apply.`);

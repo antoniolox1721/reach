@@ -27,7 +27,7 @@ If you have Node.js 18+ and git you can skip the download and use `npx github:an
 
 Leave the program running on a machine for as long as you want to reach it. It remembers its key in `~/.reach/config.json`, so next time you just start it.
 
-**Adding machines without approving each one.** Run `reach keyfile` on a machine that is already set up. It writes a `reach.key` file. Any copy of the program started from a folder that contains that file joins by itself, with no code and no prompt. Carry the program and `reach.key` together on a USB stick, and treat that file like a master password.
+**Adding machines without the dashboard at hand.** Run `reach keyfile` on a machine that is already set up. It writes a `reach.key` file. Put that file in the same folder as the program on the new machine (for example carry both on a USB stick) and start it: it finds the file, asks you to confirm with `y`, and joins. `reach join <path to reach.key>` does the same without asking, for scripts. Treat that file like a master password.
 
 ## Using your phone as a machine (Android)
 
@@ -57,7 +57,7 @@ iPhones can use the dashboard but cannot run the program.
 reach                 put this machine online (first run: shows a pairing code for your dashboard)
 reach new             first machine: create a new key and dashboard
 reach join <key>      add this machine using the key (or dashboard link) from another one
-reach keyfile         write reach.key here; a copy of reach started next to that file joins by itself
+reach keyfile         write reach.key here; reach started next to that file offers to join with it
 reach link            show the dashboard link, QR code and join command again
 reach ui [port]       serve the dashboard from this machine instead of the public page
 reach name <name>     rename this machine
