@@ -5,7 +5,7 @@ A private dashboard for your own machines. From it you browse and edit their fil
 There are two programs:
 
 - **The dashboard program** opens your dashboard. It is protected by your password and is the only thing that can control machines.
-- **Client programs** are downloaded from your dashboard. Run one on a computer and that computer appears on your dashboard. That is all a client can do: it cannot open the dashboard or control anything, and it holds nothing secret.
+- **Client programs** are downloaded from your dashboard. Run one on a computer and that computer appears on your dashboard. It runs in the background with no window, starts again whenever the computer starts, and on Windows sits as an icon next to the clock. That is all a client can do: it cannot open the dashboard or control anything, and it holds nothing secret.
 
 No VPN, no port forwarding, no account. Everything is end-to-end encrypted.
 
@@ -23,9 +23,9 @@ On Linux and Mac make it runnable first: `chmod +x reach-dashboard-*`. The progr
 
 **2. Start it.** Your browser opens the dashboard at `http://127.0.0.1:7700`. Choose **Create my dashboard** and pick a password. You type that password every time you open the dashboard.
 
-**3. Add this computer.** Choose **Add a machine**, then **Add this computer**. It appears in the list. It stays reachable for as long as the program window is open.
+**3. Add computers.** Under **Add a machine**, download the **client program** for Windows or Linux. Copy it to a computer and run it there. The computer appears on your dashboard a few seconds later, with no questions asked, and stays on it (see [the client in the background](#the-client-in-the-background)). You can reuse the same client file on as many computers as you like, including the one the dashboard is on.
 
-**4. Add other computers.** Under **Add a machine**, download the **client program** for Windows or Linux. Copy it to the other computer and run it there. The computer appears on your dashboard a few seconds later, with no questions asked. You can reuse the same client file on as many computers as you like.
+**4. Or add only this computer for now.** **Add this computer** puts the dashboard's own computer in the list, but only for as long as the dashboard program's window is open. Run the client program on it instead to keep it reachable.
 
 **5. Use it from your phone.** Under **Add a machine**, choose **Show QR code** and scan it with your phone. The phone opens the dashboard at <https://antoniolox1721.github.io/reach/> and asks you to choose a password for the phone. From then on that page is your dashboard on the phone.
 
@@ -37,9 +37,27 @@ Instead of steps 2 to 4 you can let the program prepare a kit. In a terminal, in
 reach-dashboard-windows-x64.exe kit
 ```
 
-It creates your dashboard, adds this computer to it, and writes `reach-client-windows-x64.exe` and `reach-client-linux-x64` into the folder. Then start the dashboard program: it only asks you to choose your password, and this computer is already in the list. Run a client program on any other computer and it appears by itself.
+It creates your dashboard and writes `reach-client-windows-x64.exe` and `reach-client-linux-x64` into the folder. Then start the dashboard program: it only asks you to choose your password. Run a client program on any computer and it appears by itself.
 
-Until you have chosen the password, the new dashboard key sits unprotected in `~/.reach/config.json` on that computer, so start the dashboard program right after making the kit.
+Until you have chosen the password, the new dashboard key sits unprotected in `~/.reach/config.json` on that computer, so start the dashboard program right after making the kit. Only the page that the program opens itself can collect it.
+
+### The client in the background
+
+Running a client program does three things and then returns at once:
+
+1. It copies itself to `~/.reach/bin` (on Windows `C:\Users\you\.reach\bin`), so the downloaded file or USB stick is no longer needed.
+2. It registers itself to start whenever you log in to the computer.
+3. It starts in the background, with no window.
+
+**On Windows** it shows an icon next to the clock (bottom right; it may be behind the `^` arrow). Right-click it for:
+
+- **Disable / Enable**: take this computer off your dashboard, or put it back. It stays disabled across restarts.
+- **Start with Windows**: tick or untick.
+- **Quit**: stop it until the next start.
+
+**On Linux** there is no icon. Use `~/.reach/bin/reach stop` to stop it and `~/.reach/bin/reach autostart off` to keep it from starting at login. Starting at login uses the desktop's autostart folder, so a server without a desktop session needs its own service entry running `~/.reach/bin/reach --background`.
+
+The dashboard program is different on purpose: it is an ordinary window that you open when you want your dashboard and close when you are done.
 
 ### Macs, Android phones and other machines
 
@@ -72,7 +90,11 @@ iPhones can use the dashboard but cannot be a machine on it.
 Double-clicking is enough. From a terminal:
 
 ```
-reach                 dashboard program: open the dashboard / client program: go online
+reach                 dashboard program: open the dashboard (stays in this window)
+                      client program: put this machine on the dashboard, in the background,
+                      now and every time the computer starts
+reach stop            stop the background client
+reach autostart on|off   whether the client starts with the computer
 reach kit [folder]    prepare a new dashboard for this computer plus Windows and Linux client programs
 reach pair            show a one-time code to add this machine to a dashboard, then stay online
 reach client          stay online without opening the dashboard (after this machine was added)
@@ -82,12 +104,13 @@ reach name <name>     rename this machine
 --broker <wss url>    use your own MQTT-over-WebSocket relay (saved)
 --port <number>       port for the local dashboard page (default 7700)
 --no-open             do not open the browser
+--foreground          client program: stay in this terminal instead of going to the background
 --no-qr               do not print QR codes
 ```
 
 `reach` here means the downloaded program, or `npx github:antoniolox1721/reach`.
 
-A machine is reachable only while its program is running. To keep one always reachable, start the client program when the machine starts: Task Scheduler on Windows, a systemd user service or `@reboot` cron line on Linux, Termux:Boot on Android.
+Machines added with a pairing code (`reach pair`, Macs, Termux) are reachable only while that program stays open; client programs handle this by themselves.
 
 ## Security
 

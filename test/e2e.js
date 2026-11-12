@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import nodeCrypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 
@@ -169,7 +169,7 @@ if (BIN)
     assert.ok(!res.body.includes(secret), 'no dashboard secret inside');
     const exe = path.join(tmp, 'reach-client' + (win ? '.exe' : ''));
     fs.writeFileSync(exe, res.body, { mode: 0o755 });
-    const run = spawn(exe, ['--name', 'client box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home4') }, stdio: 'ignore' });
+    const run = spawn(exe, ['--foreground', '--name', 'client box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home4') }, stdio: 'ignore' });
     children.push(run);
     await until(() => online('client box'), 'stamped client online');
     const box = online('client box').id;
@@ -186,18 +186,24 @@ if (BIN)
     const exe = fs.readdirSync(dir).map((f) => path.join(dir, f))[0];
     assert.match(path.basename(exe), /^reach-client-/);
     const port = PORT + 1;
-    reach(['--no-open', '--port', String(port), '--name', 'kit desktop'], 'home5', { stdio: 'ignore' });
-    const call = async (method, name) => {
-      const res = await fetch(`http://127.0.0.1:${port}/api/${name}`, { method, headers: { 'x-reach': '1', 'content-type': 'application/json' }, body: method === 'POST' ? '{}' : undefined });
+    const desk = reach(['--no-open', '--port', String(port), '--name', 'kit desktop'], 'home5', { stdio: ['ignore', 'pipe', 'ignore'] });
+    const call = async (method, name, body = {}) => {
+      const res = await fetch(`http://127.0.0.1:${port}/api/${name}`, { method, headers: { 'x-reach': '1', 'content-type': 'application/json' }, body: method === 'POST' ? JSON.stringify(body) : undefined });
       return { status: res.status, ...(await res.json()) };
     };
     await until(() => call('GET', 'status').then((s) => s.pending === true, () => false), 'prepared dashboard');
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/claim`, { method: 'POST' })).status, 403, 'other pages cannot take the key');
-    const { secret: kitSecret } = await call('POST', 'claim');
+    assert.equal((await call('POST', 'claim', { token: 'guess' })).status, 403, 'other local programs cannot take the key');
+    // The program passes the token only to the browser page it opens itself; a stub "browser" captures it here.
+    let out = '';
+    desk.stdout.on('data', (d) => (out += d));
+    await call('POST', 'open');
+    await until(() => /#claim=[0-9a-f]{32}/.test(out), 'dashboard opened with a claim token');
+    const { secret: kitSecret } = await call('POST', 'claim', { token: out.match(/#claim=([0-9a-f]{32})/)[1] });
     let list = [];
     const kitCtl = new Controller({ mqttConnect: mqtt.connect, secret: kitSecret, onMachines: (m) => (list = m) });
     await kitCtl.start();
-    const run = spawn(exe, ['--name', 'kit client'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home6') }, stdio: 'ignore' });
+    const run = spawn(exe, ['--foreground', '--name', 'kit client'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home6') }, stdio: 'ignore' });
     children.push(run);
     await until(() => ['kit desktop', 'kit client'].every((n) => list.some((m) => m.online && m.name === n)), 'kit computer and kit client online');
     kitCtl.stop();
@@ -205,6 +211,38 @@ if (BIN)
     assert.equal((await call('GET', 'status')).pending, false);
     assert.equal((await call('POST', 'claim')).status, 404);
     assert.ok(!fs.readFileSync(path.join(tmp, 'home5', 'config.json'), 'utf8').includes(kitSecret), 'key erased from disk after claiming');
+  });
+
+if (BIN)
+  step('a client program installs itself, runs in the background, starts with the computer, and can be stopped', async () => {
+    const home = path.join(tmp, 'home7');
+    const sport = PORT + 2;
+    const env = { ...process.env, REACH_HOME: home, REACH_RUN_NAME: 'reach-selftest', REACH_NO_TRAY: process.env.REACH_TEST_TRAY ? '' : '1' };
+    const exe = path.join(tmp, 'reach-client' + (win ? '.exe' : ''));
+    const sh = (file, args) => new Promise((r) => { const c = spawn(file, args, { env, stdio: 'ignore' }); c.on('close', r); });
+    const ping = () => fetch(`http://127.0.0.1:${sport}/api/ping`).then((r) => r.json(), () => null);
+    const startup = () => (win ? spawnSync('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'reach-selftest']).stdout.toString() : fs.existsSync(path.join(os.homedir(), '.config/autostart/reach-selftest.desktop')) ? fs.readFileSync(path.join(os.homedir(), '.config/autostart/reach-selftest.desktop'), 'utf8') : '');
+    const installed = path.join(home, 'bin', win ? 'reach.exe' : 'reach');
+    try {
+      assert.equal(await sh(exe, ['--name', 'background box', '--port', String(sport)]), 0, 'the program returns at once');
+      assert.equal((await ping())?.clientOnly, true, 'the background client is running');
+      await until(() => online('background box'), 'background client online');
+      assert.ok(fs.existsSync(installed), 'installed copy exists');
+      if (win) {
+        const b = fs.readFileSync(installed);
+        assert.equal(b.readUInt16LE(b.readUInt32LE(0x3c) + 92), 2, 'installed copy opens no console window');
+      }
+      assert.ok(startup().includes(installed) && startup().includes('--background'), 'registered to start with the computer');
+      assert.equal((await fetch(`http://127.0.0.1:${sport}/`)).status, 404, 'a client serves no dashboard page');
+      assert.equal(await sh(installed, ['autostart', 'off', '--port', String(sport)]), 0);
+      assert.ok(!startup().includes(installed), 'startup entry removed');
+      assert.equal(await sh(installed, ['stop', '--port', String(sport)]), 0);
+      assert.equal(await ping(), null, 'stopped');
+    } finally {
+      await sh(installed, ['stop', '--port', String(sport)]).catch(() => {});
+      if (win) spawnSync('reg', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'reach-selftest', '/f']);
+      else fs.rmSync(path.join(os.homedir(), '.config/autostart/reach-selftest.desktop'), { force: true });
+    }
   });
 
 step('knowing the dashboard address (what a client program holds) is not enough to control a machine', async () => {

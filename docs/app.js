@@ -75,6 +75,7 @@ let secret = null;
 let machines = [];
 let current = null; // { id, name, info, tab, files, term }
 let screen = 'boot';
+let claimToken = ''; // proves this page was opened by the reach program, which lets it collect a prepared dashboard key
 let pendingPair = null; // pairing code that arrived in the link, handled after unlock
 
 function setHeader(title, back) {
@@ -211,7 +212,7 @@ function showSetup(mode = 'create', fromLink = null) {
           go.disabled = true;
           let s;
           if (claiming) {
-            const prepared = parseLink('#' + new URLSearchParams({ k: (await api('claim', {})).secret }));
+            const prepared = parseLink('#' + new URLSearchParams({ k: (await api('claim', { token: claimToken })).secret }));
             s = { key: prepared.secret, broker: local.broker || '' };
           } else s = parsed ? { key: parsed.secret, broker: parsed.broker } : { key: await newSecret(), broker: '' };
           await saveVault(pw1.value, s);
@@ -1013,16 +1014,19 @@ async function boot() {
   }
   let fromLink = null;
   try {
-    const pair = new URLSearchParams(location.hash.slice(1)).get('pair');
+    const params = new URLSearchParams(location.hash.slice(1));
+    const pair = params.get('pair');
+    claimToken = params.get('claim') || '';
     if (pair) pendingPair = normalizePairCode(pair);
-    else if (location.hash.length > 1) fromLink = parseLink(location.hash);
+    else if (location.hash.length > 1 && !claimToken) fromLink = parseLink(location.hash);
   } catch (e) {
     toast('The link is not valid: ' + e.message, true);
   }
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);
   await refreshLocal();
   if (fromLink?.secret) showSetup('import', fromLink);
-  else if (local?.pending) showSetup('claim');
+  else if (local?.pending && claimToken) showSetup('claim');
+  else if (local?.pending) view.replaceChildren(h('div', { class: 'pad' }, h('div', { class: 'card' }, 'Your dashboard is prepared but not set up yet. To finish, open it from the reach program: start the dashboard program again, or click the reach icon next to the clock.')));
   else if (localStorage.getItem(VAULT)) showUnlock();
   else {
     if (pendingPair) toast('Open your dashboard on this device first, then scan the code again.', true);

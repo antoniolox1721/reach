@@ -5,7 +5,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import http from 'node:http';
 import nodeCrypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 import qrcode from 'qrcode-terminal';
@@ -24,6 +24,9 @@ if (PACKED) {
 }
 const HOME_DIR = process.env.REACH_HOME || path.join(os.homedir(), '.reach');
 const CONFIG = path.join(HOME_DIR, 'config.json');
+// Where the program installs the copy of itself that runs in the background and at startup.
+const INSTALLED = path.join(HOME_DIR, 'bin', process.platform === 'win32' ? 'reach.exe' : 'reach');
+const RUN_NAME = process.env.REACH_RUN_NAME || 'reach';
 const RELEASES = 'https://github.com/antoniolox1721/reach/releases/latest/download/';
 const TARGETS = ['windows-x64', 'linux-x64', 'linux-arm64'];
 const RING = 1024 * 1024;
@@ -55,6 +58,8 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--no-qr') flags.noQr = true;
     else if (a === '--no-open') flags.noOpen = true;
+    else if (a === '--foreground') flags.foreground = true;
+    else if (a === '--background') flags.background = true;
     else if (a === '--name' || a === '--broker' || a === '--port' || a === '--targets') flags[a.slice(2)] = argv[++i];
     else if (a === '-h' || a === '--help') flags.help = true;
     else rest.push(a);
@@ -67,7 +72,11 @@ const HELP = `reach ${PKG.version} - see and control your machines from your own
 The dashboard program opens your password-protected dashboard. From there you download
 client programs. A client program only puts its machine on your dashboard.
 
-  reach                 dashboard program: open the dashboard / client program: go online
+  reach                 dashboard program: open the dashboard (stays in this window)
+                        client program: put this machine on the dashboard, in the background,
+                        now and every time the computer starts
+  reach stop            stop the background client
+  reach autostart on|off   whether the client starts with the computer
   reach kit [folder]    prepare everything: a new dashboard for this computer (you only choose the
                         password) and client programs for Windows and Linux in the folder
   reach pair            show a one-time code to add this machine to a dashboard, then stay online
@@ -78,6 +87,7 @@ client programs. A client program only puts its machine on your dashboard.
   --broker <wss url>    use your own MQTT-over-WebSocket relay (saved)
   --port <number>       port for the local dashboard page (default 7700)
   --no-open             do not open the browser
+  --foreground          client program: stay in this terminal instead of going to the background
   --no-qr               do not print QR codes
 `;
 
@@ -529,7 +539,18 @@ function stampClient(program, pub, broker) {
   const link = '#' + new URLSearchParams({ p: checkPublic(pub), ...(broker ? { b: checkBroker(broker) } : {}) });
   const stamp = Buffer.from(`\n#REACH-CLIENT${link}#END#\n`, 'latin1');
   if (!STAMP.test(stamp.toString('latin1'))) throw new Error('That relay address cannot be stamped.');
-  return Buffer.concat([program, stamp]);
+  return windowless(Buffer.concat([program, stamp]));
+}
+
+// Marks a Windows program as a window-less (GUI subsystem) app so that starting it opens no console window.
+// Other programs are returned unchanged.
+function windowless(program) {
+  if (program.length < 0x40 || program.readUInt16LE(0) !== 0x5a4d) return program;
+  const pe = program.readUInt32LE(0x3c);
+  if (pe + 94 > program.length || program.readUInt32LE(pe) !== 0x4550) return program;
+  const out = Buffer.from(program);
+  out.writeUInt16LE(2, pe + 24 + 68);
+  return out;
 }
 
 const programCache = new Map();
@@ -566,6 +587,8 @@ function serveDashboard(cfg, port, state) {
 
   const api = async (req, res, url) => {
     const name = url.pathname.slice(5);
+    if (name === 'ping') return json(res, 200, { reach: PKG.version, clientOnly: !!state.clientOnly });
+    if (state.clientOnly && name !== 'quit') return json(res, 404, { error: 'not found' });
     if (name === 'client' && req.method === 'GET') {
       // The page starts this as a normal download. It returns a program that holds no secret.
       const target = url.searchParams.get('target');
@@ -576,12 +599,23 @@ function serveDashboard(cfg, port, state) {
     // Everything else changes this machine, so it must come from our own page (a custom header cannot be sent cross-site).
     if (req.headers['x-reach'] !== '1') return json(res, 403, { error: 'forbidden' });
     if (name === 'status' && req.method === 'GET') {
-      return json(res, 200, { name: cfg.name, os: osLabel(), version: PKG.version, target: ownTarget(), targets: TARGETS, enrolled: state.client?.dpub || '', pairCode: state.pairCode || '', pending: !!cfg.pending, broker: cfg.broker || '' });
+      return json(res, 200, { name: cfg.name, os: osLabel(), version: PKG.version, target: ownTarget(), targets: TARGETS, enrolled: state.client?.dpub || (state.serviceRunning && cfg.dpub) || '', pairCode: state.pairCode || '', pending: !!cfg.pending, broker: cfg.broker || '' });
     }
     // A dashboard prepared by "reach kit" waits here until the page has locked it with the user's password.
+    // The key is handed only to the page this program opened itself, which carries a one-time token.
     if (name === 'claim' && req.method === 'POST') {
       if (!cfg.pending) return json(res, 404, { error: 'No prepared dashboard is waiting.' });
+      const token = String((await readBody(req)).token || '');
+      if (token.length !== state.claimToken.length || !nodeCrypto.timingSafeEqual(Buffer.from(token), Buffer.from(state.claimToken))) return json(res, 403, { error: 'Open the dashboard from the reach program to finish setting it up.' });
       return json(res, 200, { secret: cfg.pending, broker: cfg.broker || '' });
+    }
+    if (name === 'quit' && req.method === 'POST') {
+      json(res, 200, { ok: true });
+      return void setTimeout(state.quit, 100);
+    }
+    if (name === 'open' && req.method === 'POST') {
+      state.openDashboard();
+      return json(res, 200, { ok: true });
     }
     if (name === 'claimed' && req.method === 'POST') {
       delete cfg.pending;
@@ -605,6 +639,7 @@ function serveDashboard(cfg, port, state) {
       return res.writeHead(403).end();
     }
     if (url.pathname.startsWith('/api/')) return api(req, res, url).catch((e) => json(res, 400, { error: String(e.message || e) }));
+    if (state.clientOnly) return res.writeHead(404).end();
     const name = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
     const send = (data) => res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' }).end(data);
     if (PACKED) return Object.hasOwn(PACKED, name) ? send(PACKED[name]) : res.writeHead(404).end();
@@ -613,7 +648,7 @@ function serveDashboard(cfg, port, state) {
     fs.readFile(file, (e, data) => (e ? res.writeHead(404).end() : send(data)));
   });
   return new Promise((resolve, reject) => {
-    server.once('error', (e) => reject(e.code === 'EADDRINUSE' ? new Error(`Port ${port} is busy. The dashboard program is probably already running: open http://127.0.0.1:${port}/`) : e));
+    server.once('error', (e) => reject(e.code === 'EADDRINUSE' ? new Error(`Port ${port} is busy. reach is probably already running in the background ("reach stop" stops it).`) : e));
     server.listen(port, '127.0.0.1', () => resolve(server));
   });
 }
@@ -646,14 +681,123 @@ async function makeKit(cfg, folder, targets) {
   console.log('  2. Run a client program on any other computer. It appears on your dashboard by itself.');
 }
 
+// ---------- background service: install, autostart, tray icon ----------
+
+const local = (port, name, method = 'GET') =>
+  fetch(`http://127.0.0.1:${port}/api/${name}`, { method, headers: { 'x-reach': '1', 'content-type': 'application/json' }, body: method === 'POST' ? '{}' : undefined, signal: AbortSignal.timeout(2000) })
+    .then((r) => r.json())
+    .catch(() => null);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function stopService(port) {
+  if (!(await local(port, 'ping'))?.reach) return false;
+  await local(port, 'quit', 'POST');
+  for (let i = 0; i < 40 && (await local(port, 'ping'))?.reach; i++) await sleep(250);
+  return true;
+}
+
+// Copies this program to its permanent place. The installed Windows copy is window-less.
+function install() {
+  if (path.resolve(process.execPath) === INSTALLED) return;
+  fs.mkdirSync(path.dirname(INSTALLED), { recursive: true });
+  const tmp = INSTALLED + '.new';
+  fs.writeFileSync(tmp, windowless(fs.readFileSync(process.execPath)), { mode: 0o755 });
+  fs.renameSync(tmp, INSTALLED);
+}
+
+const autostartFile = path.join(os.homedir(), '.config', 'autostart', RUN_NAME + '.desktop');
+const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+
+function setAutostart(on, port) {
+  const args = '--background' + (port !== 7700 ? ' --port ' + port : '');
+  if (process.platform === 'win32') {
+    const r = on ? spawnSync('reg', ['add', RUN_KEY, '/v', RUN_NAME, '/t', 'REG_SZ', '/d', `"${INSTALLED}" ${args}`, '/f'], { windowsHide: true }) : spawnSync('reg', ['delete', RUN_KEY, '/v', RUN_NAME, '/f'], { windowsHide: true });
+    return r.status === 0;
+  }
+  if (process.platform !== 'linux') return false;
+  if (!on) return fs.rmSync(autostartFile, { force: true }), true;
+  fs.mkdirSync(path.dirname(autostartFile), { recursive: true });
+  fs.writeFileSync(autostartFile, `[Desktop Entry]\nType=Application\nName=reach\nExec="${INSTALLED}" ${args}\nX-GNOME-Autostart-enabled=true\n`);
+  return true;
+}
+
+function hasAutostart() {
+  if (process.platform === 'win32') return spawnSync('reg', ['query', RUN_KEY, '/v', RUN_NAME], { windowsHide: true }).status === 0;
+  return fs.existsSync(autostartFile);
+}
+
+// Windows notification-area icon, drawn and run by a hidden PowerShell helper. It prints the menu item that
+// was clicked and reads one JSON line per update. When this program ends, its input closes and it exits.
+const TRAY_SCRIPT = String.raw`
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$bmp = New-Object System.Drawing.Bitmap 32, 32
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.SmoothingMode = 'AntiAlias'
+$g.Clear([System.Drawing.Color]::FromArgb(15, 18, 22))
+$green = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(74, 222, 128)), 4
+$white = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(230, 234, 239)), 4
+$g.DrawLines($green, [System.Drawing.Point[]]@((New-Object System.Drawing.Point 7, 8), (New-Object System.Drawing.Point 16, 16), (New-Object System.Drawing.Point 7, 24)))
+$g.DrawLine($white, 18, 24, 27, 24)
+$n = New-Object System.Windows.Forms.NotifyIcon
+$n.Icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+$n.Text = 'reach'
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+$open = $menu.Items.Add('Open dashboard')
+$toggle = $menu.Items.Add('Disable')
+$auto = $menu.Items.Add('Start with Windows')
+[void]$menu.Items.Add('-')
+$quit = $menu.Items.Add('Quit')
+$open.add_Click({ [Console]::Out.WriteLine('open') })
+$toggle.add_Click({ [Console]::Out.WriteLine('toggle') })
+$auto.add_Click({ [Console]::Out.WriteLine('autostart') })
+$quit.add_Click({ [Console]::Out.WriteLine('quit') })
+$n.add_MouseClick({ if ($_.Button -eq 'Left' -and $open.Visible) { [Console]::Out.WriteLine('open') } })
+$n.ContextMenuStrip = $menu
+$n.Visible = $true
+$script:task = [Console]::In.ReadLineAsync()
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 250
+$timer.add_Tick({
+  while ($script:task.IsCompleted) {
+    $line = $script:task.Result
+    if ($null -eq $line) { $n.Visible = $false; $n.Dispose(); [System.Windows.Forms.Application]::Exit(); return }
+    try {
+      $m = $line | ConvertFrom-Json
+      if ($null -ne $m.text) { $n.Text = [string]$m.text }
+      if ($null -ne $m.toggle) { $toggle.Text = [string]$m.toggle }
+      if ($null -ne $m.canToggle) { $toggle.Enabled = [bool]$m.canToggle }
+      if ($null -ne $m.auto) { $auto.Checked = [bool]$m.auto }
+      if ($null -ne $m.open) { $open.Visible = [bool]$m.open }
+      if ($null -ne $m.balloon) { $n.ShowBalloonTip(5000, 'reach', [string]$m.balloon, 'Info') }
+    } catch {}
+    $script:task = [Console]::In.ReadLineAsync()
+  }
+})
+$timer.Start()
+[Console]::Out.WriteLine('ready')
+[System.Windows.Forms.Application]::Run()
+`;
+
+function startTray(onCommand) {
+  if (process.platform !== 'win32' || process.env.REACH_NO_TRAY) return null;
+  const child = spawn('powershell.exe', ['-NoProfile', '-NoLogo', '-STA', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', Buffer.from(TRAY_SCRIPT, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+  child.on('error', () => {});
+  child.stdin.on('error', () => {});
+  let buf = '';
+  child.stdout.on('data', (d) => {
+    buf += d;
+    for (let i; (i = buf.indexOf('\n')) >= 0; buf = buf.slice(i + 1)) onCommand(buf.slice(0, i).trim());
+  });
+  return { update: (m) => child.stdin.write(JSON.stringify(m) + '\n'), close: () => child.stdin.end() };
+}
+
 // ---------- cli ----------
 
 async function main() {
   const { flags, rest } = parseArgs(process.argv.slice(2));
   const cmd = rest[0] || 'up';
   if (flags.help || cmd === 'help') return console.log(HELP);
-  if (!['up', 'pair', 'client', 'name', 'kit'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
-
+  if (!['up', 'pair', 'client', 'name', 'kit', 'stop', 'autostart'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
   const cfg = loadConfig();
   if (flags.name) cfg.name = flags.name;
   if (flags.broker !== undefined) cfg.broker = checkBroker(flags.broker);
@@ -672,23 +816,70 @@ async function main() {
   }
   if (cfg.dpub) checkPublic(cfg.dpub);
   saveConfig(cfg);
+  // The dashboard page uses 7700. The background client answers "are you running?" and "stop" on 7701.
+  const servicePort = stamp || cmd !== 'up' ? Number(flags.port) || 7701 : 7701;
+  const port = Number(flags.port) || 7700;
   if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}".`);
   if (cmd === 'kit') {
     if (stamp) throw new Error('This is a client program. Use the dashboard program to make a kit.');
     return makeKit(cfg, path.resolve(rest[1] || '.'), (flags.targets || 'windows-x64,linux-x64').split(','));
   }
+  if (cmd === 'stop') return console.log((await stopService(servicePort)) ? 'Stopped.' : 'The reach client is not running in the background.');
+  if (cmd === 'autostart') {
+    if (!['on', 'off'].includes(rest[1])) throw new Error('Usage: reach autostart on|off');
+    cfg.autostart = rest[1] === 'on';
+    saveConfig(cfg);
+    if (cfg.autostart) {
+      if (!stamp) throw new Error('Only client programs start with the computer. Run the client program from your dashboard on this machine.');
+      install();
+    }
+    if (!setAutostart(cfg.autostart, servicePort)) throw new Error('Starting with the computer is not supported on this system.');
+    return console.log(cfg.autostart ? 'reach now starts with the computer.' : 'reach no longer starts with the computer.');
+  }
 
+  // A client program hands over to an installed copy of itself that runs in the background and at startup.
+  if (cmd === 'up' && stamp && !flags.foreground && !flags.background) {
+    await stopService(servicePort);
+    install();
+    if (cfg.autostart !== false) setAutostart(true, servicePort);
+    spawn(INSTALLED, ['--background', '--port', String(servicePort)], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    for (let i = 0; i < 60 && !(await local(servicePort, 'ping'))?.reach; i++) await sleep(250);
+    if (!(await local(servicePort, 'ping'))?.reach) throw new Error('reach did not start in the background. Try again with --foreground to see why.');
+    console.log(`"${cfg.name}" is on your dashboard. reach keeps running in the background and starts with the computer.`);
+    if (process.platform !== 'win32') console.log(`Stop it with:           "${INSTALLED}" stop\nNo longer at startup:   "${INSTALLED}" autostart off`);
+    return;
+  }
+
+  const background = !!flags.background && !!stamp;
+  // If the background client already runs on this computer, the dashboard program must not start a second one.
+  const serviceRunning = !background && !!(await local(7701, 'ping'))?.reach;
+  const url = `http://127.0.0.1:${port}/`;
+  let tray = null;
   const state = {
     client: null,
     pairCode: '',
+    clientOnly: !!stamp,
+    serviceRunning,
+    claimToken: randId(16),
+    openDashboard() {
+      const link = url + (cfg.pending ? '#claim=' + state.claimToken : '');
+      flags.noOpen ? console.log('Open: ' + link) : openBrowser(link);
+    },
+    async quit() {
+      tray?.close();
+      await state.client?.stop();
+      process.exit(0);
+    },
     async enroll(pub, broker) {
       if (state.client?.dpub === pub && (cfg.broker || '') === broker) return;
       await state.client?.stop();
       cfg.dpub = pub;
       cfg.broker = broker;
+      cfg.disabled = false;
       saveConfig(cfg);
       state.client = await startClient(cfg);
       console.log(`"${cfg.name}" is now on the dashboard.`);
+      refreshTray(`"${cfg.name}" is now on your dashboard.`);
     },
     startPairing() {
       if (state.pairCode) return state.pairCode;
@@ -700,14 +891,43 @@ async function main() {
       return code;
     },
   };
-  const shutdown = async () => {
-    await state.client?.stop();
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  const refreshTray = (balloon) =>
+    tray?.update({
+      text: !cfg.dpub ? 'reach: not on a dashboard yet' : cfg.disabled ? 'reach: disabled' : `reach: ${cfg.name} is on your dashboard`.slice(0, 63),
+      toggle: cfg.disabled ? 'Enable' : 'Disable',
+      canToggle: !!cfg.dpub,
+      auto: hasAutostart(),
+      open: !stamp,
+      ...(balloon ? { balloon } : {}),
+    });
+  process.on('SIGINT', state.quit);
+  process.on('SIGTERM', state.quit);
 
-  if (cfg.dpub) state.client = await startClient(cfg);
+  if (cfg.dpub && !(background && cfg.disabled) && !serviceRunning) state.client = await startClient(cfg);
+
+  if (background) {
+    await serveDashboard(cfg, servicePort, state);
+    tray = startTray(async (command) => {
+      if (command === 'ready') refreshTray(cfg.disabled ? 'reach is disabled. Right-click this icon to enable it.' : `"${cfg.name}" is on your dashboard. Right-click this icon to disable or quit.`);
+      else if (command === 'open') state.openDashboard();
+      else if (command === 'quit') state.quit();
+      else if (command === 'autostart') {
+        cfg.autostart = !hasAutostart();
+        saveConfig(cfg);
+        setAutostart(cfg.autostart, servicePort);
+        refreshTray();
+      } else if (command === 'toggle' && cfg.dpub) {
+        cfg.disabled = !cfg.disabled;
+        saveConfig(cfg);
+        if (cfg.disabled) {
+          await state.client?.stop();
+          state.client = null;
+        } else state.client = await startClient(cfg);
+        refreshTray(cfg.disabled ? 'Disabled: this computer is off your dashboard until you enable it again.' : `"${cfg.name}" is back on your dashboard.`);
+      }
+    });
+    return;
+  }
 
   // A stamped program is a client and nothing else: it never opens a dashboard.
   if (stamp || cmd === 'client') {
@@ -725,12 +945,10 @@ async function main() {
     return console.log('Waiting. Leave this open: afterwards the machine stays on the dashboard for as long as this runs.\n');
   }
 
-  const port = Number(flags.port) || 7700;
   await serveDashboard(cfg, port, state);
-  const url = `http://127.0.0.1:${port}/`;
   console.log(`reach ${PKG.version} dashboard: ${url}\n\nIt opens in your browser and asks for your password. Keep this window open while you use it.`);
   if (cfg.dpub) console.log(`"${cfg.name}" is also on the dashboard while this stays open.`);
-  if (!flags.noOpen) openBrowser(url);
+  if (!flags.noOpen) state.openDashboard();
 }
 
 main().catch((e) => {
