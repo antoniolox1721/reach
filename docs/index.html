@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src wss: ws:; worker-src blob:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self' wss: ws:; worker-src blob:; base-uri 'none'; form-action 'none'">
 <meta name="theme-color" content="#0f1216">
 <title>reach</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
@@ -21,6 +21,7 @@
 <div id="transfers"></div>
 <div id="toasts"></div>
 <script src="mqtt.min.js"></script>
+<script src="qrcode.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>

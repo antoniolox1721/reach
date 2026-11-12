@@ -9,8 +9,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 import qrcode from 'qrcode-terminal';
-import readline from 'node:readline';
-import { Link, deriveKeys, newKey, newPairCode, pairWait, parseKeyInput, checkBroker, randId, CHUNK, DEFAULT_BROKER } from './docs/core.js';
+import { Link, seal, unseal, channelKey, fleetBase, agentIdOf, newSecret, publicOf, checkPublic, checkBroker, newPairCode, pairWait, randId, b64u, CHUNK, DEFAULT_BROKER } from './docs/core.js';
 
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 
@@ -18,7 +17,6 @@ if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 const PACKED = typeof __REACH_ASSETS__ !== 'undefined' ? __REACH_ASSETS__ : null;
 const ROOT = PACKED ? path.dirname(process.execPath) : path.dirname(fileURLToPath(import.meta.url));
 const PKG = PACKED ? __REACH_PKG__ : JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-const KEYFILE = 'reach.key';
 if (PACKED) {
   // Set by the build banner for the bundled ws library; not meant for the commands we start.
   delete process.env.WS_NO_BUFFER_UTIL;
@@ -26,6 +24,8 @@ if (PACKED) {
 }
 const HOME_DIR = process.env.REACH_HOME || path.join(os.homedir(), '.reach');
 const CONFIG = path.join(HOME_DIR, 'config.json');
+const RELEASES = 'https://github.com/antoniolox1721/reach/releases/latest/download/';
+const TARGETS = ['windows-x64', 'linux-x64', 'linux-arm64'];
 const RING = 1024 * 1024;
 const MAX_JOBS = 30;
 const READ_WINDOW = 16;
@@ -54,45 +54,30 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--no-qr') flags.noQr = true;
-    else if (a === '--name' || a === '--broker' || a === '--dashboard') flags[a.slice(2)] = argv[++i];
+    else if (a === '--no-open') flags.noOpen = true;
+    else if (a === '--name' || a === '--broker' || a === '--port') flags[a.slice(2)] = argv[++i];
     else if (a === '-h' || a === '--help') flags.help = true;
     else rest.push(a);
   }
   return { flags, rest };
 }
 
-const HELP = `reach ${PKG.version} - control your machines from any of your machines
+const HELP = `reach ${PKG.version} - see and control your machines from your own dashboard
 
-  reach                 put this machine online (first run: shows a pairing code for your dashboard)
-  reach new             first machine: create a new key and dashboard
-  reach join <key>      add this machine using the key (or dashboard link) from another one
-  reach personal [file] make a personal copy of the program (or of a downloaded one) that joins by itself
-  reach keyfile         write reach.key here; reach started next to that file offers to join with it
-  reach link            show the dashboard link, QR code and join command again
-  reach ui [port]       serve the dashboard from this machine instead of the public page
+The dashboard program opens your password-protected dashboard. From there you download
+client programs. A client program only puts its machine on your dashboard.
+
+  reach                 dashboard program: open the dashboard / client program: go online
+  reach pair            show a one-time code to add this machine to a dashboard, then stay online
+  reach client          stay online without opening the dashboard (after this machine was added)
   reach name <name>     rename this machine
-  reach rekey           replace the key (every other machine must join again)
 
   --name <name>         name for this machine (saved)
   --broker <wss url>    use your own MQTT-over-WebSocket relay (saved)
-  --dashboard <url>     dashboard address to print in links (saved)
-  --no-qr               do not print the QR code
+  --port <number>       port for the local dashboard page (default 7700)
+  --no-open             do not open the browser
+  --no-qr               do not print QR codes
 `;
-
-function dashboardLink(cfg, base) {
-  const p = new URLSearchParams({ k: cfg.key });
-  if (cfg.broker) p.set('b', cfg.broker);
-  return (base || cfg.dashboard || PKG.homepage) + '#' + p.toString();
-}
-
-function printAccess(cfg, noQr) {
-  const link = dashboardLink(cfg);
-  console.log('\nOpen the dashboard on any device (scan with your phone):\n\n  ' + link + '\n');
-  if (!noQr) qrcode.generate(link, { small: true }, (q) => console.log(q.replace(/^/gm, '  ')));
-  console.log('Add another machine: start reach on it and enter the code it shows under "Add a machine" in the dashboard.');
-  console.log('Or join directly with the key:\n\n  reach join ' + cfg.key + (cfg.broker ? ' --broker ' + cfg.broker : '') + '\n');
-  console.log('Keep the key secret. Anyone who has it can read files and run commands on every machine.\n');
-}
 
 // ---------- machine info ----------
 
@@ -101,6 +86,8 @@ function osLabel() {
   if (process.platform === 'linux' && /microsoft/i.test(os.release())) return 'wsl';
   return { win32: 'windows', darwin: 'mac' }[process.platform] || process.platform;
 }
+
+const ownTarget = () => `${{ win32: 'windows', darwin: 'macos' }[process.platform] || process.platform}-${process.arch}`;
 
 function roots() {
   const out = [];
@@ -126,20 +113,32 @@ function userName() {
   }
 }
 
-// ---------- agent ----------
+// ---------- client: makes this machine reachable from the dashboard it belongs to ----------
 
-async function runAgent(cfg, flags) {
-  const keys = await deriveKeys(cfg.key);
+class Reply {
+  constructor(r, body) {
+    this.r = r;
+    this.body = body;
+  }
+}
+
+async function startClient(cfg) {
+  const pubRaw = b64u.dec(publicOf(cfg.asecret));
+  const aid = await agentIdOf(pubRaw);
+  // Only the holder of the dashboard secret can derive this key, so only the dashboard can send us requests.
+  const key = await channelKey(cfg.asecret, b64u.dec(checkPublic(cfg.dpub)));
+  const base = await fleetBase(cfg.dpub);
+  const T = { hello: `${base}/hello/${aid}`, to: `${base}/${aid}/to`, out: `${base}/${aid}/out`, who: `${base}/who`, re: (f) => `${base}/${aid}/re/${f}` };
   const boot = randId(6);
   const sessions = new Map();
   const reads = new Map();
   const writes = new Map();
   const jobs = new Map();
+  const timers = [];
   let jobSeq = 0;
 
-  const presence = (y) => ({ y, f: cfg.id, id: cfg.id, name: cfg.name, os: osLabel(), host: os.hostname(), boot, ts: Date.now() });
   const info = () => ({
-    id: cfg.id,
+    id: aid,
     name: cfg.name,
     host: os.hostname(),
     os: osLabel(),
@@ -153,20 +152,37 @@ async function runAgent(cfg, flags) {
     version: PKG.version,
   });
 
-  const link = await Link.open({
+  // Presence carries our public key in the clear so the dashboard can derive the shared key.
+  const hello = async (y) => {
+    const sealed = await seal(key, T.hello, { y, name: cfg.name, os: osLabel(), host: os.hostname(), boot, ts: Date.now() });
+    const out = new Uint8Array(65 + sealed.length);
+    out.set(pubRaw);
+    out.set(sealed, 65);
+    return out;
+  };
+  let lastAnnounce = 0;
+  const announce = (force) => {
+    if (!force && Date.now() - lastAnnounce < 1000) return;
+    lastAnnounce = Date.now();
+    link.publish(T.hello, () => hello('pres'), 0).catch(() => {});
+  };
+
+  const link = Link.open({
     mqttConnect: mqtt.connect,
     broker: cfg.broker,
-    keys,
-    subscribe: ['who', 'to/' + cfg.id],
-    will: { suffix: 'pres', header: presence('bye') },
+    subscribe: [T.who, T.to],
+    will: { topic: T.hello, payload: Buffer.from(await hello('bye')) },
     onStatus: (s) => {
       console.log(new Date().toLocaleTimeString() + (s === 'online' ? '  connected' : '  disconnected, retrying...'));
-      if (s === 'online') announce();
+      if (s === 'online') announce(true);
+    },
+    route: async (topic, payload) => {
+      if (topic === T.who) return announce(false);
+      const m = await unseal(key, topic, payload);
+      if (m) handle(m.h, m.body);
     },
   });
-  const announce = () => link.send('pres', presence('pres'), null, 0).catch(() => {});
-  setInterval(announce, 20000);
-  link.on('who', announce);
+  timers.push(setInterval(() => announce(true), 20000));
 
   const resolveP = (p) => {
     if (!p) return os.homedir();
@@ -410,48 +426,52 @@ async function runAgent(cfg, flags) {
   }
 
   // Publishes job output at a bounded rate; anything it skips stays readable through 'tail'.
-  setInterval(() => {
-    if (!link.connected) return;
-    for (const j of jobs.values()) {
-      if (link.unacked > 8) return;
-      const end = j.start + j.buf.length;
-      if (j.cursor < j.start) j.cursor = j.start;
-      if (j.cursor < end) {
-        const chunk = j.buf.subarray(j.cursor - j.start, Math.min(end, j.cursor + CHUNK) - j.start);
-        link.send('out/' + cfg.id, { y: 'out', f: cfg.id, job: j.id, off: j.cursor }, chunk).catch(() => {});
-        j.cursor += chunk.length;
-      } else if (!j.running && !j.exitSent) {
-        j.exitSent = true;
-        link.send('out/' + cfg.id, { y: 'exit', f: cfg.id, job: j.id, code: j.code, end }).catch(() => {});
+  timers.push(
+    setInterval(() => {
+      if (!link.connected) return;
+      for (const j of jobs.values()) {
+        if (link.unacked > 8) return;
+        const end = j.start + j.buf.length;
+        if (j.cursor < j.start) j.cursor = j.start;
+        if (j.cursor < end) {
+          const chunk = j.buf.subarray(j.cursor - j.start, Math.min(end, j.cursor + CHUNK) - j.start);
+          link.send(key, T.out, { y: 'out', job: j.id, off: j.cursor }, chunk).catch(() => {});
+          j.cursor += chunk.length;
+        } else if (!j.running && !j.exitSent) {
+          j.exitSent = true;
+          link.send(key, T.out, { y: 'exit', job: j.id, code: j.code, end }).catch(() => {});
+        }
       }
-    }
-  }, 100);
+    }, 100)
+  );
 
   // Drop uploads whose sender disappeared.
-  setInterval(() => {
-    for (const [x, w] of writes) if (Date.now() - w.touched > 120000) abortWrite(x);
-  }, 30000);
+  timers.push(
+    setInterval(() => {
+      for (const [x, w] of writes) if (Date.now() - w.touched > 120000) abortWrite(x);
+    }, 30000)
+  );
 
-  link.on('to/' + cfg.id, (h, body) => {
-    if (typeof h.f !== 'string') return;
-    const to = 'to/' + h.f;
+  function handle(h, body) {
+    if (typeof h.f !== 'string' || !/^c[0-9a-f]{16}$/.test(h.f)) return;
+    const to = T.re(h.f);
     if (h.y === 'hello') {
       const s = randId(12);
       sessions.set(s, { f: h.f, n: 0 });
       if (sessions.size > 500) sessions.delete(sessions.keys().next().value);
-      link.send(to, { y: 'welcome', f: cfg.id, c: h.c, s, info: info() }).catch(() => {});
+      link.send(key, to, { y: 'welcome', c: h.c, s, info: info() }).catch(() => {});
       return;
     }
     if (h.y !== 'req') return;
     const sess = sessions.get(h.s);
     if (!sess || sess.f !== h.f) {
-      link.send(to, { y: 'nosession', f: cfg.id, id: h.id }).catch(() => {});
+      link.send(key, to, { y: 'nosession', id: h.id }).catch(() => {});
       return;
     }
     // Each request carries a strictly increasing counter, so a recorded request cannot be replayed.
     if (!Number.isInteger(h.n) || h.n <= sess.n) return;
     sess.n = h.n;
-    const ctx = { id: h.id, ev: (extra, b) => link.send(to, { y: 'ev', f: cfg.id, id: h.id, ...extra }, b) };
+    const ctx = { id: h.id, ev: (extra, b) => link.send(key, to, { y: 'ev', id: h.id, ...extra }, b) };
     let result;
     try {
       if (!Object.hasOwn(ops, h.op)) throw new Error('Unknown operation: ' + h.op);
@@ -460,139 +480,137 @@ async function runAgent(cfg, flags) {
       result = Promise.reject(e);
     }
     result
-      .then((r) => (r instanceof Reply ? link.send(to, { y: 'res', f: cfg.id, id: h.id, ok: true, r: r.r }, r.body) : link.send(to, { y: 'res', f: cfg.id, id: h.id, ok: true, r: r ?? null })))
-      .catch((e) => link.send(to, { y: 'res', f: cfg.id, id: h.id, ok: false, e: String(e?.message || e) }))
+      .then((r) => (r instanceof Reply ? link.send(key, to, { y: 'res', id: h.id, ok: true, r: r.r }, r.body) : link.send(key, to, { y: 'res', id: h.id, ok: true, r: r ?? null })))
+      .catch((e) => link.send(key, to, { y: 'res', id: h.id, ok: false, e: String(e?.message || e) }))
       .catch(() => {});
-  });
-
-  const shutdown = () => {
-    for (const j of jobs.values()) if (j.running) killJob(j);
-    link.send('pres', presence('bye'), null, 0).catch(() => {});
-    setTimeout(() => process.exit(0), 300);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
-  console.log(`reach ${PKG.version}: "${cfg.name}" is going online. Leave this running. Ctrl+C stops it.`);
-  printAccess(cfg, flags.noQr);
-}
-
-class Reply {
-  constructor(r, body) {
-    this.r = r;
-    this.body = body;
   }
+
+  return {
+    dpub: cfg.dpub,
+    async stop() {
+      for (const t of timers) clearInterval(t);
+      for (const j of jobs.values()) if (j.running) killJob(j);
+      await Promise.race([link.publish(T.hello, () => hello('bye'), 0).catch(() => {}), new Promise((r) => setTimeout(r, 300))]);
+      link.close();
+    },
+  };
 }
 
-// ---------- local dashboard ----------
+// ---------- client programs: this executable with a dashboard's public address stamped onto its end ----------
 
-function serveUi(cfg, port) {
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
-  const docs = path.join(ROOT, 'docs');
-  http
-    .createServer((req, res) => {
-      const rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-      const name = rel === '/' ? 'index.html' : rel.slice(1);
-      const send = (data) => res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' }).end(data);
-      if (PACKED) return Object.hasOwn(PACKED, name) ? send(PACKED[name]) : res.writeHead(404).end();
-      const file = path.join(docs, name);
-      if (!file.startsWith(docs + path.sep) || !types[path.extname(file)]) return res.writeHead(404).end();
-      fs.readFile(file, (e, data) => (e ? res.writeHead(404).end() : send(data)));
-    })
-    .listen(port, '127.0.0.1', () => {
-      const base = `http://127.0.0.1:${port}/`;
-      console.log('Dashboard on this machine only:\n\n  ' + (cfg.key ? dashboardLink(cfg, base) : base) + '\n');
-    });
+const STAMP = /\n#REACH-CLIENT(#p=[A-Za-z0-9_-]{87}(?:&b=[A-Za-z0-9_%.~+-]+)?)#END#\n$/;
+
+function findStamp(data) {
+  const m = STAMP.exec(data.subarray(Math.max(0, data.length - 1024)).toString('latin1'));
+  if (!m) return null;
+  const p = new URLSearchParams(m[1].slice(1));
+  return { pub: checkPublic(p.get('p')), broker: checkBroker(p.get('b') || ''), length: Buffer.byteLength(m[0], 'latin1') };
 }
 
-// ---------- first run: get the key ----------
-
-// ---------- personal copy: an executable with the key stamped onto its end ----------
-
-const STAMP = /\n#REACH-PERSONAL(#k=[A-Za-z0-9_%.~&=+:/\[\]@-]+)#END#\n$/;
-
-function readStamp(file) {
-  const fd = fs.openSync(file, 'r');
+function ownStamp() {
+  if (!PACKED) return null;
+  const fd = fs.openSync(process.execPath, 'r');
   try {
     const size = fs.fstatSync(fd).size;
     const buf = Buffer.alloc(Math.min(size, 1024));
     fs.readSync(fd, buf, 0, buf.length, size - buf.length);
-    const m = STAMP.exec(buf.toString('latin1'));
-    return m ? { link: m[1], length: Buffer.byteLength(m[0], 'latin1') } : null;
+    return findStamp(buf);
   } finally {
     fs.closeSync(fd);
   }
 }
 
-// The key this executable was stamped with, if it is a personal copy.
-function stampedKey() {
-  if (!PACKED) return null;
-  const stamp = readStamp(process.execPath);
-  return stamp ? parseKeyInput(stamp.link) : null;
+// The stamp holds nothing secret: it only says which dashboard the machine should appear on.
+function stampClient(program, pub, broker) {
+  const old = findStamp(program);
+  if (old) program = program.subarray(0, program.length - old.length);
+  const link = '#' + new URLSearchParams({ p: checkPublic(pub), ...(broker ? { b: checkBroker(broker) } : {}) });
+  const stamp = Buffer.from(`\n#REACH-CLIENT${link}#END#\n`, 'latin1');
+  if (!STAMP.test(stamp.toString('latin1'))) throw new Error('That relay address cannot be stamped.');
+  return Buffer.concat([program, stamp]);
 }
 
-function makePersonal(cfg, source) {
-  if (!cfg.key) throw new Error('No key yet. Start reach once on this machine first.');
-  source = source || (PACKED ? process.execPath : null);
-  if (!source) throw new Error('Usage: reach personal <downloaded reach program>');
-  let data = fs.readFileSync(source);
-  if (data.readUInt32LE(0) === 0xfeedfacf) throw new Error('Mac programs cannot be stamped (it breaks their signature). On a Mac use "reach keyfile" instead.');
-  const old = readStamp(source);
-  if (old) data = data.subarray(0, data.length - old.length);
-  const link = '#' + new URLSearchParams({ k: cfg.key, ...(cfg.broker ? { b: cfg.broker } : {}) });
-  const out = path.resolve('my-' + path.basename(source).replace(/^my-/, ''));
-  if (out === path.resolve(source)) throw new Error('Run this from a different folder than the program itself.');
-  fs.writeFileSync(out, Buffer.concat([data, Buffer.from(`\n#REACH-PERSONAL${link}#END#\n`, 'latin1')]), { mode: 0o755 });
-  console.log(`Wrote ${out}\n\nRun that file on any of your machines and it joins your dashboard by itself.`);
-  console.log('It contains your key. Keep it to yourself: never upload it, share it or leave it on a machine that is not yours.');
+const programCache = new Map();
+async function programFor(target) {
+  if (!TARGETS.includes(target)) throw new Error('Unknown system: ' + target);
+  if (PACKED && target === ownTarget()) return fs.readFileSync(process.execPath);
+  if (!programCache.has(target)) {
+    const url = `${RELEASES}reach-dashboard-${target}${target.startsWith('windows') ? '.exe' : ''}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Could not download ${url} (${res.status}).`);
+    programCache.set(target, Buffer.from(await res.arrayBuffer()));
+  }
+  return programCache.get(target);
 }
 
-const ask = (question) =>
-  new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => (rl.close(), resolve(answer.trim())));
+// ---------- dashboard program: serves the dashboard page to this computer only ----------
+
+function serveDashboard(cfg, port, state) {
+  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+  const docs = path.join(ROOT, 'docs');
+  const json = (res, code, body) => res.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(body));
+  const readBody = (req) =>
+    new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', (d) => ((data += d), data.length > 4096 && reject(new Error('too large'))));
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data || '{}'));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+  const api = async (req, res, url) => {
+    const name = url.pathname.slice(5);
+    if (name === 'client' && req.method === 'GET') {
+      // The page starts this as a normal download. It returns a program that holds no secret.
+      const target = url.searchParams.get('target');
+      const data = stampClient(await programFor(target), url.searchParams.get('p'), url.searchParams.get('b') || '');
+      const file = `reach-client-${target}${target.startsWith('windows') ? '.exe' : ''}`;
+      return res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': data.length, 'content-disposition': `attachment; filename="${file}"`, 'cache-control': 'no-store' }).end(data);
+    }
+    // Everything else changes this machine, so it must come from our own page (a custom header cannot be sent cross-site).
+    if (req.headers['x-reach'] !== '1') return json(res, 403, { error: 'forbidden' });
+    if (name === 'status' && req.method === 'GET') {
+      return json(res, 200, { name: cfg.name, os: osLabel(), version: PKG.version, target: ownTarget(), targets: TARGETS, enrolled: state.client?.dpub || '', pairCode: state.pairCode || '' });
+    }
+    if (name === 'enroll' && req.method === 'POST') {
+      const body = await readBody(req);
+      await state.enroll(checkPublic(body.p), checkBroker(body.b || ''));
+      return json(res, 200, { ok: true });
+    }
+    if (name === 'pair' && req.method === 'POST') return json(res, 200, { code: state.startPairing() });
+    return json(res, 404, { error: 'not found' });
+  };
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    // Refuse other sites reaching this server through the browser (cross-site requests, DNS rebinding).
+    const site = req.headers['sec-fetch-site'];
+    if (![`127.0.0.1:${port}`, `localhost:${port}`].includes(req.headers.host) || (site && site !== 'same-origin' && !(site === 'none' && !url.pathname.startsWith('/api/')))) {
+      return res.writeHead(403).end();
+    }
+    if (url.pathname.startsWith('/api/')) return api(req, res, url).catch((e) => json(res, 400, { error: String(e.message || e) }));
+    const name = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
+    const send = (data) => res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' }).end(data);
+    if (PACKED) return Object.hasOwn(PACKED, name) ? send(PACKED[name]) : res.writeHead(404).end();
+    const file = path.join(docs, name);
+    if (!file.startsWith(docs + path.sep) || !types[path.extname(file)]) return res.writeHead(404).end();
+    fs.readFile(file, (e, data) => (e ? res.writeHead(404).end() : send(data)));
   });
-
-// A reach.key file next to the program lets a copy carried on a USB stick join without a pairing code.
-// It is never used silently: a planted file would otherwise enrol this machine in someone else's dashboard.
-async function keyFileNextToProgram() {
-  const file = path.join(ROOT, KEYFILE);
-  let got;
-  try {
-    got = parseKeyInput(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    if (e.code === 'ENOENT') return null;
-    throw new Error(`${file}: ${e.message}`);
-  }
-  if (!process.stdin.isTTY) {
-    console.log(`Ignoring ${file}: nobody is here to confirm it. Use "reach join ${file}" to use it on purpose.`);
-    return null;
-  }
-  console.log(`\nFound a key file: ${file}` + (got.broker ? `\nIt uses the relay ${got.broker}` : ''));
-  console.log('Whoever made that file will be able to read files and run commands on this machine.');
-  return /^y(es)?$/i.test(await ask('Did you put it there yourself, and do you want to join that dashboard? [y/N] ')) ? got : null;
+  return new Promise((resolve, reject) => {
+    server.once('error', (e) => reject(e.code === 'EADDRINUSE' ? new Error(`Port ${port} is busy. The dashboard program is probably already running: open http://127.0.0.1:${port}/`) : e));
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
 }
 
-// Shows a one-time code and waits for a dashboard to approve it. Enter creates a new dashboard instead.
-async function pairOrCreate(cfg, flags) {
-  const code = newPairCode();
-  const link = (cfg.dashboard || PKG.homepage) + '#pair=' + code;
-  console.log(`\nThis machine ("${cfg.name}") is not on a dashboard yet.\n`);
-  console.log('To add it: open your dashboard, choose "Add a machine" and enter this code:\n\n    ' + code + '\n');
-  if (!flags.noQr) {
-    console.log('or scan this with the phone that already has your dashboard:\n');
-    qrcode.generate(link, { small: true }, (q) => console.log(q.replace(/^/gm, '  ')));
-  }
-  const tty = process.stdin.isTTY;
-  if (tty) console.log('First machine? Press Enter to create a new dashboard instead.\n');
-  const wait = pairWait({ mqttConnect: mqtt.connect, broker: cfg.broker, code, name: cfg.name });
-  const rl = tty ? readline.createInterface({ input: process.stdin }) : null;
-  const enter = new Promise((resolve) => rl?.once('line', () => resolve(null)));
-  const got = await Promise.race([wait.promise, enter]);
-  rl?.close();
-  wait.cancel();
-  if (got) console.log('Approved from your dashboard.\n');
-  return got || { key: newKey(), broker: '' };
+function openBrowser(url) {
+  const [cmd, args] = process.platform === 'win32' ? ['cmd.exe', ['/c', 'start', '', url]] : process.platform === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
+  try {
+    spawn(cmd, args, { stdio: 'ignore', detached: true, windowsHide: true }).on('error', () => {}).unref();
+  } catch {}
 }
 
 // ---------- cli ----------
@@ -601,68 +619,81 @@ async function main() {
   const { flags, rest } = parseArgs(process.argv.slice(2));
   const cmd = rest[0] || 'up';
   if (flags.help || cmd === 'help') return console.log(HELP);
+  if (!['up', 'pair', 'client', 'name'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
 
   const cfg = loadConfig();
-  let dirty = false;
-  const set = (k, v) => {
-    if (v !== undefined && cfg[k] !== v) {
-      cfg[k] = v;
-      dirty = true;
-    }
-  };
-  set('name', flags.name);
-  set('broker', flags.broker === undefined ? undefined : checkBroker(flags.broker));
-  set('dashboard', flags.dashboard);
-  if (!cfg.id) set('id', 'm' + randId(6));
-  if (!cfg.name) set('name', os.hostname());
-
-  if (cmd === 'join') {
-    // The argument is a key, a dashboard link, or the path of a reach.key file.
-    const isFile = rest[1] && fs.existsSync(rest[1]) && fs.statSync(rest[1]).isFile();
-    const { key, broker } = parseKeyInput(isFile ? fs.readFileSync(rest[1], 'utf8') : rest[1]);
-    await deriveKeys(key);
-    set('key', key);
-    if (broker) set('broker', broker);
-  } else if (cmd === 'rekey') {
-    set('key', newKey());
-  } else if (cmd === 'name') {
+  if (flags.name) cfg.name = flags.name;
+  if (flags.broker !== undefined) cfg.broker = checkBroker(flags.broker);
+  if (cmd === 'name') {
     if (!rest[1]) throw new Error('Usage: reach name <name>');
-    set('name', rest.slice(1).join(' '));
-  } else if (cmd === 'new') {
-    if (cfg.key) throw new Error('This machine already has a key. Use "reach rekey" to replace it.');
-    set('key', newKey());
+    cfg.name = rest.slice(1).join(' ');
   }
-  if (cfg.broker === DEFAULT_BROKER) set('broker', '');
+  if (!cfg.name) cfg.name = os.hostname();
+  if (!cfg.asecret) cfg.asecret = await newSecret();
+  if (cfg.broker === DEFAULT_BROKER) cfg.broker = '';
   checkBroker(cfg.broker);
-  if (cfg.key) parseKeyInput(cfg.key);
-  const stamped = cmd === 'up' ? stampedKey() : null;
-  if (stamped) {
-    set('key', stamped.key);
-    set('broker', stamped.broker);
+  const stamp = ownStamp();
+  if (stamp) {
+    cfg.dpub = stamp.pub;
+    cfg.broker = stamp.broker;
   }
-  if (cmd === 'up' && !cfg.key) {
-    const got = (await keyFileNextToProgram()) || (await pairOrCreate(cfg, flags));
-    set('key', got.key);
-    if (got.broker) set('broker', got.broker);
-  }
-  if (dirty) saveConfig(cfg);
+  if (cfg.dpub) checkPublic(cfg.dpub);
+  saveConfig(cfg);
+  if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}".`);
 
-  if (cmd === 'up' || cmd === 'join' || cmd === 'new') return runAgent(cfg, flags);
-  if (cmd === 'personal') return makePersonal(cfg, rest[1]);
-  if (cmd === 'keyfile') {
-    if (!cfg.key) throw new Error('No key yet. Run "reach" first.');
-    const link = '#' + new URLSearchParams({ k: cfg.key, ...(cfg.broker ? { b: cfg.broker } : {}) });
-    fs.writeFileSync(KEYFILE, link + '\n', { mode: 0o600 });
-    return console.log(`Wrote ${path.resolve(KEYFILE)}. Keep it secret. Put it in the same folder as the reach program on another machine and start it, or run \"reach join <that file>\".`);
+  const state = {
+    client: null,
+    pairCode: '',
+    async enroll(pub, broker) {
+      if (state.client?.dpub === pub && (cfg.broker || '') === broker) return;
+      await state.client?.stop();
+      cfg.dpub = pub;
+      cfg.broker = broker;
+      saveConfig(cfg);
+      state.client = await startClient(cfg);
+      console.log(`"${cfg.name}" is now on the dashboard.`);
+    },
+    startPairing() {
+      if (state.pairCode) return state.pairCode;
+      const code = (state.pairCode = newPairCode());
+      pairWait({ mqttConnect: mqtt.connect, broker: cfg.broker, code, name: cfg.name })
+        .promise.then((got) => state.enroll(got.pub, got.broker))
+        .catch((e) => console.error('Pairing failed: ' + e.message))
+        .finally(() => (state.pairCode = ''));
+      return code;
+    },
+  };
+  const shutdown = async () => {
+    await state.client?.stop();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  if (cfg.dpub) state.client = await startClient(cfg);
+
+  // A stamped program is a client and nothing else: it never opens a dashboard.
+  if (stamp || cmd === 'client') {
+    if (!cfg.dpub) throw new Error('This machine is not on a dashboard yet. Run "reach pair", or use a client program downloaded from your dashboard.');
+    return console.log(`reach ${PKG.version}: "${cfg.name}" is on your dashboard while this stays open. Ctrl+C stops it.`);
   }
-  if (cmd === 'ui') return serveUi(cfg, Number(rest[1]) || 7700);
-  if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}". Restart reach to apply.`);
-  if (cmd === 'link' || cmd === 'rekey') {
-    if (!cfg.key) throw new Error('No key yet. Run "reach" first.');
-    if (cmd === 'rekey') console.log('New key saved. Restart reach here and run "reach join" with the new key on every other machine.');
-    return printAccess(cfg, flags.noQr);
+
+  if (cmd === 'pair') {
+    const code = state.startPairing();
+    console.log(`\nTo put "${cfg.name}" on your dashboard, open the dashboard, choose "Add a machine" and enter this code:\n\n    ${code}\n`);
+    if (!flags.noQr) {
+      console.log('or scan this with the phone that has your dashboard:\n');
+      qrcode.generate(PKG.homepage + '#pair=' + code, { small: true }, (q) => console.log(q.replace(/^/gm, '  ')));
+    }
+    return console.log('Waiting. Leave this open: afterwards the machine stays on the dashboard for as long as this runs.\n');
   }
-  throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
+
+  const port = Number(flags.port) || 7700;
+  await serveDashboard(cfg, port, state);
+  const url = `http://127.0.0.1:${port}/`;
+  console.log(`reach ${PKG.version} dashboard: ${url}\n\nIt opens in your browser and asks for your password. Keep this window open while you use it.`);
+  if (cfg.dpub) console.log(`"${cfg.name}" is also on the dashboard while this stays open.`);
+  if (!flags.noOpen) openBrowser(url);
 }
 
 main().catch((e) => {

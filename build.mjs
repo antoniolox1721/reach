@@ -1,6 +1,6 @@
 // Builds a standalone executable for the current OS: bundles reach.js and the dashboard into one script,
 // then embeds it in a copy of the Node.js binary (Node "single executable application").
-//   node build.mjs                bundle + build dist/reach-<os>-<arch>[.exe]
+//   node build.mjs                bundle + build dist/reach-dashboard-<os>-<arch>[.exe]
 //   node build.mjs --inject-only  reuse an existing dist/reach.cjs (bundle made on another OS)
 //   node build.mjs --smoke        run the built executable's --help
 import fs from 'node:fs';
@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process';
 
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 const os = { win32: 'windows', darwin: 'macos', linux: 'linux' }[process.platform] || process.platform;
-const out = path.join('dist', `reach-${os}-${process.arch}${process.platform === 'win32' ? '.exe' : ''}`);
+const out = path.join('dist', `reach-dashboard-${os}-${process.arch}${process.platform === 'win32' ? '.exe' : ''}`);
 const bundle = path.join('dist', 'reach.cjs');
 const blob = path.join('dist', 'sea.blob');
 

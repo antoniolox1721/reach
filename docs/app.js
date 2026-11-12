@@ -1,6 +1,7 @@
-import { Controller, parseKeyInput, deriveKeys, pairOffer, normalizePairCode, b64u } from './core.js';
+import { Controller, parseLink, newSecret, pairOffer, normalizePairCode, b64u } from './core.js';
 
-const VAULT = 'reach.vault';
+const VAULT = 'reach.vault2';
+const PAGES = 'https://antoniolox1721.github.io/reach/';
 const PBKDF2_ITERATIONS = 600000;
 const MAX_OPEN = 2 * 1024 * 1024;
 const MAX_TERM = 300000;
@@ -93,6 +94,7 @@ window.addEventListener('popstate', () => {
 });
 
 function lock() {
+  adding = false;
   ctl?.stop();
   ctl = null;
   secret = null;
@@ -100,6 +102,42 @@ function lock() {
   machines = [];
   setStatus('');
   showUnlock();
+}
+
+// ---------- this computer's dashboard program (absent on the public page) ----------
+
+let local = null;
+
+async function api(name, body) {
+  const res = await fetch('/api/' + name, { method: body ? 'POST' : 'GET', headers: { 'x-reach': '1', ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'The dashboard program refused that.');
+  return data;
+}
+
+async function refreshLocal() {
+  try {
+    const status = await api('status');
+    local = status.version ? status : null;
+  } catch {
+    local = null;
+  }
+}
+
+function qrCanvas(text) {
+  const q = window.qrcode(0, 'M');
+  q.addData(text);
+  q.make();
+  const n = q.getModuleCount();
+  const scale = 4;
+  const size = (n + 8) * scale;
+  const canvas = h('canvas', { class: 'qr', width: size, height: size });
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, size, size);
+  g.fillStyle = '#000';
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) g.fillRect((c + 4) * scale, (r + 4) * scale, scale, scale);
+  return canvas;
 }
 
 // ---------- sign-in screens ----------
@@ -126,16 +164,16 @@ function showUnlock() {
         }
       },
     },
-    h('div', { class: 'card' }, h('p', null, 'Enter your password to unlock this device.'), h('label', null, 'Password'), pw, msg, h('div', { class: 'row' }, go)),
+    h('div', { class: 'card' }, h('p', null, 'Enter your password to open your dashboard.'), h('label', null, 'Password'), pw, msg, h('div', { class: 'row' }, go)),
     h(
       'button',
       {
         class: 'ghost danger small',
         type: 'button',
         onclick: () => {
-          if (!confirm('Remove the saved key from this device? You will need the dashboard link again.')) return;
+          if (!confirm('Remove the dashboard from this device? If no other device has it, you lose access to your machines and must set them up again.')) return;
           localStorage.removeItem(VAULT);
-          showSetup('');
+          showSetup();
         },
       },
       'Forget this device'
@@ -145,15 +183,17 @@ function showUnlock() {
   pw.focus();
 }
 
-function showSetup(prefill, broker = '') {
+// mode 'create': new dashboard. mode 'import': an existing dashboard's key, typed or from a link.
+function showSetup(mode = 'create', fromLink = null) {
   screen = 'setup';
   setHeader('reach', false);
   const hadVault = !!localStorage.getItem(VAULT);
-  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Key or dashboard link', value: prefill });
+  const importing = mode === 'import';
+  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Dashboard link or key' });
   const pw1 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters' });
   const pw2 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'Repeat the password' });
   const msg = h('p', { class: 'error' });
-  const go = h('button', { class: 'primary', type: 'submit' }, 'Save and connect');
+  const go = h('button', { class: 'primary', type: 'submit' }, importing ? 'Save and open' : 'Create my dashboard');
   const form = h(
     'form',
     {
@@ -162,12 +202,12 @@ function showSetup(prefill, broker = '') {
         e.preventDefault();
         msg.textContent = '';
         try {
-          const parsed = parseKeyInput(key.value);
-          await deriveKeys(parsed.key);
+          const parsed = importing ? fromLink || parseLink(key.value) : null;
+          if (parsed && !parsed.secret) throw new Error('That is not a valid dashboard key.');
           if (pw1.value.length < 8) throw new Error('Use a password of at least 8 characters.');
           if (pw1.value !== pw2.value) throw new Error('The two passwords do not match.');
           go.disabled = true;
-          const s = { key: parsed.key, broker: parsed.broker || broker };
+          const s = parsed ? { key: parsed.secret, broker: parsed.broker } : { key: await newSecret(), broker: '' };
           await saveVault(pw1.value, s);
           await connect(s);
         } catch (err) {
@@ -179,24 +219,50 @@ function showSetup(prefill, broker = '') {
     h(
       'div',
       { class: 'card' },
-      prefill
-        ? h('p', null, 'Key received from the link. Only continue if this link came from your own machine: the dashboard will control whatever machines use that key. Choose a password for this device. You will type it each time you open this page.')
-        : h('p', null, 'Run ', h('code', null, 'reach'), ' on one of your machines, then open the link it prints (or paste the key here).'),
-      prefill && hadVault && h('p', { class: 'error' }, 'This device already has a saved key. Continuing replaces it with the key from the link.'),
-      broker && h('p', { class: 'small' }, 'This link uses a custom relay: ', h('code', null, broker)),
-      h('label', null, 'Key'),
-      key,
-      h('label', null, 'Password for this device'),
+      importing
+        ? h('p', null, fromLink ? 'Dashboard key received from the link. Only continue if you made this link yourself, on your own dashboard.' : 'Paste the link or key of your existing dashboard.')
+        : h('p', null, 'Create your dashboard. It is protected by a password that you type each time you open it.'),
+      fromLink && hadVault && h('p', { class: 'error' }, 'This device already has a dashboard. Continuing replaces it with the one from the link.'),
+      fromLink?.broker && h('p', { class: 'small' }, 'This link uses a custom relay: ', h('code', null, fromLink.broker)),
+      importing && !fromLink && h('label', null, 'Dashboard link or key'),
+      importing && !fromLink && key,
+      h('label', null, 'Password'),
       pw1,
       h('label', null, 'Repeat password'),
       pw2,
       msg,
-      h('div', { class: 'row' }, go, prefill && hadVault && h('button', { type: 'button', onclick: showUnlock }, 'Keep my saved key'))
+      h('div', { class: 'row' }, go, fromLink && hadVault && h('button', { type: 'button', onclick: showUnlock }, 'Keep my dashboard'))
     ),
-    h('p', { class: 'dim small' }, 'The key never leaves this device unencrypted: it is stored here locked with your password, and this page has no server.')
+    !fromLink && h('p', null, h('button', { class: 'ghost small', type: 'button', onclick: () => showSetup(importing ? 'create' : 'import') }, importing ? 'Create a new dashboard instead' : 'I already have a dashboard on another device')),
+    !fromLink && local && h('p', null, h('button', { class: 'ghost small', type: 'button', onclick: () => showPairHere().catch(fail) }, 'Only add this computer to a dashboard I have elsewhere')),
+    h('p', { class: 'dim small' }, 'Your dashboard key is stored on this device only, locked with your password. Client programs never contain it.')
   );
   view.replaceChildren(form);
-  (prefill ? pw1 : key).focus();
+  (importing && !fromLink ? key : pw1).focus();
+}
+
+// For a computer that should only be a client: shows a one-time code to approve from the dashboard elsewhere.
+async function showPairHere() {
+  const { code } = await api('pair', {});
+  screen = 'pairhere';
+  const state = h('p', { class: 'dim' }, 'Waiting for you to approve it on your dashboard…');
+  view.replaceChildren(
+    h(
+      'div',
+      { class: 'pad' },
+      h('div', { class: 'card center' }, h('p', null, 'On your dashboard choose "Add a machine" and enter this code:'), h('p', { class: 'bigcode mono' }, code), h('p', { class: 'dim small' }, 'or scan it with the phone that has your dashboard'), qrCanvas(PAGES + '#pair=' + code), state),
+      h('p', null, h('button', { class: 'ghost small', onclick: () => showSetup() }, 'Back'))
+    )
+  );
+  const timer = setInterval(async () => {
+    if (screen !== 'pairhere') return clearInterval(timer);
+    await refreshLocal();
+    if (local?.enrolled) {
+      clearInterval(timer);
+      state.className = '';
+      state.textContent = 'Done. This computer is on your dashboard for as long as the program window stays open. You can close this tab.';
+    }
+  }, 2000);
 }
 
 async function connect(s) {
@@ -204,11 +270,11 @@ async function connect(s) {
   ctl = new Controller({
     mqttConnect: window.mqtt.connect,
     broker: s.broker || undefined,
-    key: s.key,
+    secret: s.key,
     onStatus: setStatus,
     onMachines: (list) => {
       machines = list;
-      if (screen === 'machines') showMachines();
+      if (screen === 'machines') drawCards();
     },
   });
   await ctl.start();
@@ -220,7 +286,7 @@ async function connect(s) {
   }
 }
 
-// Sends the key to the machine that is showing this one-time code.
+// Tells the machine that is showing this one-time code which dashboard it belongs to.
 async function addMachine(input) {
   let code;
   try {
@@ -228,10 +294,10 @@ async function addMachine(input) {
   } catch (e) {
     return fail(e);
   }
-  if (!confirm(`Add the machine showing code ${code}?\n\nOnly continue if you can see this exact code on a machine you just started yourself. That machine gets your key: it joins your dashboard and whoever controls it can reach all your machines.`)) return;
+  if (!confirm(`Add the machine showing code ${code} to your dashboard?`)) return;
   toast('Looking for the machine…');
   try {
-    const name = await pairOffer({ mqttConnect: window.mqtt.connect, broker: secret.broker || undefined, code, secret });
+    const name = await pairOffer({ mqttConnect: window.mqtt.connect, broker: secret.broker || undefined, code, pub: ctl.pub });
     toast(`Added "${name}". It will appear in the list in a moment.`);
   } catch (e) {
     fail(e);
@@ -240,9 +306,11 @@ async function addMachine(input) {
 
 // ---------- machine list ----------
 
-function showMachines() {
-  screen = 'machines';
-  setHeader('My machines', false);
+let adding = false; // whether the "Add a machine" panel is open
+const cardList = h('div');
+
+// Redraws only the machine cards, so presence updates never disturb what the user is typing below them.
+function drawCards() {
   const cards = machines.map((m) =>
     h(
       'button',
@@ -251,14 +319,53 @@ function showMachines() {
       h('span', { class: 'grow' }, h('div', { class: 'name' }, m.name), h('div', { class: 'dim small' }, m.os + (m.host && m.host !== m.name ? ' · ' + m.host : '') + (m.online ? '' : ' · offline')))
     )
   );
-  const joinCmd = 'npx github:antoniolox1721/reach join ' + secret.key + (secret.broker ? ' --broker ' + secret.broker : '');
-  const keyBox = h('div', { hidden: true }, h('p', { class: 'dim small' }, 'With Node.js installed you can also run this on the new machine. It contains your key, so do not share it.'), h('div', { class: 'cmdbox mono' }, joinCmd));
+  cardList.replaceChildren(...(cards.length ? cards : [h('div', { class: 'empty' }, 'No machines yet. Choose "Add a machine" below.')]));
+}
+
+function showMachines() {
+  screen = 'machines';
+  setHeader('My machines', false);
+  drawCards();
+  const query = new URLSearchParams({ p: ctl.pub, ...(secret.broker ? { b: secret.broker } : {}) });
+  const names = { 'windows-x64': 'Windows', 'linux-x64': 'Linux', 'linux-arm64': 'Linux (ARM)' };
   const codeInput = h('input', { class: 'mono', placeholder: 'XXXX-XXXX-XXXX', 'aria-label': 'Pairing code', autocapitalize: 'characters', autocomplete: 'off', spellcheck: 'false' });
-  const reveal = h(
+  const panel = h(
     'div',
-    { hidden: true },
-    h('p', { class: 'small' }, '1. On the new machine, download and start reach: ', h('a', { href: 'https://github.com/antoniolox1721/reach/releases/latest', target: '_blank', rel: 'noopener noreferrer' }, 'get the program'), '.'),
-    h('p', { class: 'small' }, '2. It shows a code. Type it here (or scan its QR code with this phone).'),
+    { hidden: !adding },
+    local &&
+      local.enrolled !== ctl.pub &&
+      h(
+        'p',
+        null,
+        h(
+          'button',
+          {
+            class: 'primary',
+            onclick: async () => {
+              try {
+                await api('enroll', { p: ctl.pub, b: secret.broker || '' });
+                await refreshLocal();
+                toast(`Added this computer ("${local.name}").`);
+                showMachines();
+              } catch (e) {
+                fail(e);
+              }
+            },
+          },
+          'Add this computer'
+        )
+      ),
+    h('h3', null, 'Another computer'),
+    local
+      ? h(
+          'div',
+          null,
+          h('p', { class: 'small' }, 'Download the client program, copy it to the other computer and run it there. The computer appears here by itself. A client program can only add its computer to this dashboard; it cannot open the dashboard or control anything.'),
+          h('div', { class: 'row wrap' }, local.targets.map((t) => h('a', { class: 'button', href: '/api/client?target=' + t + '&' + query, download: '' }, 'Client for ' + (names[t] || t))))
+        )
+      : h('p', { class: 'small' }, 'Client programs are made by the dashboard program on a computer: ', h('a', { href: 'https://github.com/antoniolox1721/reach/releases/latest', target: '_blank', rel: 'noopener noreferrer' }, 'get it here'), ', open your dashboard there and choose "Add a machine".'),
+    h('h3', null, 'With a code'),
+    h('p', { class: 'small' }, 'For a Mac, a phone, or a machine that is showing a pairing code: type the code here.'),
     h(
       'form',
       {
@@ -271,17 +378,44 @@ function showMachines() {
       codeInput,
       h('button', { class: 'primary', type: 'submit' }, 'Add')
     ),
-    h('p', null, h('button', { class: 'ghost small', onclick: () => (keyBox.hidden = !keyBox.hidden) }, 'Use the key instead')),
-    keyBox
+    h('h3', null, 'Open this dashboard on my phone'),
+    h('p', { class: 'small' }, 'Shows a QR code to scan with your phone. It contains your dashboard key, so do not let anyone else see or photograph it.'),
+    h('p', null, h('button', { onclick: showPhoneLink }, 'Show QR code'))
   );
   view.replaceChildren(
     h(
       'div',
       { class: 'pad' },
-      cards.length ? cards : h('div', { class: 'empty' }, 'Looking for your machines… Make sure reach is running on at least one.'),
-      h('div', { class: 'card' }, h('button', { class: 'ghost', onclick: () => (reveal.hidden = !reveal.hidden) }, '+ Add a machine'), reveal)
+      cardList,
+      h(
+        'div',
+        { class: 'card' },
+        h(
+          'button',
+          {
+            class: 'ghost',
+            onclick: () => {
+              adding = !adding;
+              panel.hidden = !adding;
+            },
+          },
+          '+ Add a machine'
+        ),
+        panel
+      )
     )
   );
+}
+
+function showPhoneLink() {
+  const link = PAGES + '#' + new URLSearchParams({ k: secret.key, ...(secret.broker ? { b: secret.broker } : {}) });
+  const close = () => overlay.remove();
+  const overlay = h(
+    'div',
+    { class: 'overlay', onclick: (e) => e.target === overlay && close() },
+    h('div', { class: 'sheet center' }, h('h2', null, 'Scan with your phone'), qrCanvas(link), h('p', { class: 'small' }, 'Your phone opens the dashboard and asks you to choose a password for it. This code is your dashboard key: close this when you are done.'), h('button', { class: 'primary', onclick: close }, 'Done'))
+  );
+  document.body.append(overlay);
 }
 
 async function openMachine(m) {
@@ -845,7 +979,7 @@ async function renderScripts(body) {
 
 // ---------- boot ----------
 
-function boot() {
+async function boot() {
   if (!window.isSecureContext || !crypto.subtle) {
     view.replaceChildren(h('div', { class: 'pad' }, h('div', { class: 'card' }, 'This page needs HTTPS (or http://127.0.0.1) to do encryption.')));
     return;
@@ -854,17 +988,18 @@ function boot() {
   try {
     const pair = new URLSearchParams(location.hash.slice(1)).get('pair');
     if (pair) pendingPair = normalizePairCode(pair);
-    else if (location.hash.length > 1) fromLink = parseKeyInput(location.hash);
+    else if (location.hash.length > 1) fromLink = parseLink(location.hash);
   } catch (e) {
     toast('The link is not valid: ' + e.message, true);
   }
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);
-  if (fromLink?.key) showSetup(fromLink.key, fromLink.broker);
+  await refreshLocal();
+  if (fromLink?.secret) showSetup('import', fromLink);
   else if (localStorage.getItem(VAULT)) showUnlock();
   else {
-    if (pendingPair) toast('Set up your dashboard on this device first, then scan the code again.', true);
+    if (pendingPair) toast('Open your dashboard on this device first, then scan the code again.', true);
     pendingPair = null;
-    showSetup('');
+    showSetup();
   }
 }
 

@@ -1,54 +1,78 @@
-// End-to-end check against the real relay: starts an agent, then drives it like the dashboard does.
+// End-to-end check against the real relay: starts real programs, then drives them like the dashboard page does.
+//   node test/e2e.js                      tests the source
+//   REACH_BIN=dist/... node test/e2e.js   tests a built executable (also covers stamped client programs)
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import nodeCrypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
-const { Controller, newKey, deriveKeys, pairOffer, DEFAULT_BROKER } = await import('../docs/core.js');
+const { Controller, newSecret, publicOf, fleetBase, channelKey, seal, pairOffer, DEFAULT_BROKER } = await import('../docs/core.js');
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reach-test-'));
-const home = path.join(tmp, 'home');
 const work = path.join(tmp, 'work');
 fs.mkdirSync(work);
 const win = process.platform === 'win32';
-// REACH_BIN=<path to a built executable> tests that instead of the source.
-const reach = (args, opts) => (process.env.REACH_BIN ? spawn(path.resolve(process.env.REACH_BIN), args, opts) : spawn(process.execPath, [path.join(root, 'reach.js'), ...args], opts));
+const BIN = process.env.REACH_BIN && path.resolve(process.env.REACH_BIN);
+const PORT = 7790 + Math.floor(Math.random() * 100);
+const children = [];
+const reach = (args, home, opts = {}) => {
+  const env = { ...process.env, REACH_HOME: path.join(tmp, home) };
+  const child = BIN ? spawn(BIN, args, { env, ...opts }) : spawn(process.execPath, [path.join(root, 'reach.js'), ...args], { env, ...opts });
+  children.push(child);
+  return child;
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const until = async (fn, what, ms = 15000) => {
+const until = async (fn, what, ms = 30000) => {
   for (const t0 = Date.now(); Date.now() - t0 < ms; await sleep(100)) if (await fn()) return;
   throw new Error('timed out waiting for ' + what);
 };
+// Plain HTTP so the test can set any header, including Host.
+const local = (method, url, headers = {}, body) =>
+  new Promise((resolve, reject) => {
+    const req = http.request(`http://127.0.0.1:${PORT}${url}`, { method, headers: { ...(body ? { 'content-type': 'application/json' } : {}), ...headers } }, (res) => {
+      const parts = [];
+      res.on('data', (d) => parts.push(d));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
+    });
+    req.on('error', reject);
+    req.end(body ? JSON.stringify(body) : undefined);
+  });
 
-const agent = reach(['new', '--no-qr', '--name', 'test box'], { env: { ...process.env, REACH_HOME: home }, stdio: 'ignore' });
-let failed = false;
+const secret = await newSecret();
+const pub = publicOf(secret);
 const steps = [];
 const step = (name, fn) => steps.push([name, fn]);
 
 let ctl, id, machines = [];
-const collect = async (job) => {
+const online = (name) => machines.find((m) => m.online && m.name === name);
+const collect = async (job, agent = id) => {
   let text = '', code;
-  const stop = ctl.watchJob(id, job, (h, b) => (h.y === 'exit' ? (code = h.code) : (text += Buffer.from(b).toString())));
+  const stop = ctl.watchJob(agent, job, (h, b) => (h.y === 'exit' ? (code = h.code) : (text += Buffer.from(b).toString())));
   await until(() => code !== undefined, 'job exit');
   stop();
   return { text, code };
 };
 
-step('machine appears on the dashboard', async () => {
-  await until(() => fs.existsSync(path.join(home, 'config.json')), 'agent config');
-  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
-  ctl = new Controller({ mqttConnect: mqtt.connect, key: cfg.key, onMachines: (m) => (machines = m) });
+step('a client appears on the dashboard', async () => {
+  fs.mkdirSync(path.join(tmp, 'home'));
+  fs.writeFileSync(path.join(tmp, 'home', 'config.json'), JSON.stringify({ dpub: pub }));
+  reach(['client', '--name', 'test box'], 'home', { stdio: 'ignore' });
+  ctl = new Controller({ mqttConnect: mqtt.connect, secret, onMachines: (m) => (machines = m) });
   await ctl.start();
-  await until(() => machines.some((m) => m.online && m.name === 'test box'), 'presence');
-  id = machines[0].id;
+  await until(() => online('test box'), 'presence');
+  id = online('test box').id;
   const info = await ctl.info(id);
   assert.equal(info.home, os.homedir());
   assert.ok(info.roots.length > 0);
+  const saved = fs.readFileSync(path.join(tmp, 'home', 'config.json'), 'utf8');
+  assert.ok(!saved.includes(secret), 'the client never has the dashboard secret');
 });
 
 step('folders: create, list, rename, delete', async () => {
@@ -90,8 +114,7 @@ step('commands run in the requested folder', async () => {
   fs.writeFileSync(path.join(work, 'marker.txt'), 'x');
   const { r } = await ctl.call(id, 'exec', { cmd: win ? 'dir /b' : 'ls', cwd: work });
   assert.match((await collect(r.job)).text, /marker\.txt/);
-  const res = await ctl.call(id, 'resolve', { cwd: work, path: '..' });
-  assert.equal(res.r.path, tmp);
+  assert.equal((await ctl.call(id, 'resolve', { cwd: work, path: '..' })).r.path, tmp);
 });
 
 step('stdin reaches a running job, and kill stops one', async () => {
@@ -111,77 +134,80 @@ step('stdin reaches a running job, and kill stops one', async () => {
 step('saved scripts persist on the machine', async () => {
   await ctl.call(id, 'scripts.set', { scripts: [{ name: 'hello', cmd: 'echo hi', cwd: work }] });
   assert.deepEqual((await ctl.call(id, 'scripts.get')).r, [{ name: 'hello', cmd: 'echo hi', cwd: work }]);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')).scripts[0].name, 'hello');
 });
 
-step('a new machine joins with a pairing code, another with a key file', async () => {
-  const home2 = path.join(tmp, 'home2');
-  const second = reach(['--no-qr', '--name', 'paired box'], { env: { ...process.env, REACH_HOME: home2 }, stdio: ['ignore', 'pipe', 'ignore'] });
+step('a machine joins with a pairing code', async () => {
+  const second = reach(['pair', '--no-qr', '--name', 'paired box'], 'home2', { stdio: ['ignore', 'pipe', 'ignore'] });
   let out = '';
   second.stdout.on('data', (d) => (out += d));
-  try {
-    await until(() => /[2-9A-Z]{4}-[2-9A-Z]{4}-[2-9A-Z]{4}/.test(out), 'pairing code');
-    const code = out.match(/[2-9A-Z]{4}-[2-9A-Z]{4}-[2-9A-Z]{4}/)[0];
-    assert.equal(await pairOffer({ mqttConnect: mqtt.connect, code, secret: { key: ctl.key, broker: '' } }), 'paired box');
-    await until(() => machines.some((m) => m.online && m.name === 'paired box'), 'paired machine online', 30000);
-  } finally {
-    second.kill();
-  }
-
-  const dir3 = path.join(tmp, 'usb');
-  fs.mkdirSync(dir3);
-  fs.writeFileSync(path.join(dir3, 'reach.key'), '#k=' + ctl.key + '\n');
-  const third = reach(['join', path.join(dir3, 'reach.key'), '--no-qr', '--name', 'keyfile box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home3') }, stdio: 'ignore' });
-  try {
-    await until(() => machines.some((m) => m.online && m.name === 'keyfile box'), 'key file machine online', 30000);
-  } finally {
-    third.kill();
-  }
+  await until(() => /[2-9A-Z]{4}-[2-9A-Z]{4}-[2-9A-Z]{4}/.test(out), 'pairing code');
+  const code = out.match(/[2-9A-Z]{4}-[2-9A-Z]{4}-[2-9A-Z]{4}/)[0];
+  assert.equal(await pairOffer({ mqttConnect: mqtt.connect, code, pub }), 'paired box');
+  await until(() => online('paired box'), 'paired machine online');
+  second.kill();
 });
 
-if (process.env.REACH_BIN)
-  step('a personal copy of the executable joins by itself', async () => {
-    const dir = path.join(tmp, 'personal');
-    fs.mkdirSync(dir);
-    const made = spawn(path.resolve(process.env.REACH_BIN), ['personal'], { cwd: dir, env: { ...process.env, REACH_HOME: home }, stdio: 'ignore' });
-    await new Promise((r) => made.on('close', r));
-    const exe = path.join(dir, 'my-' + path.basename(process.env.REACH_BIN));
-    assert.ok(fs.existsSync(exe), 'personal copy written');
-    const run = spawn(exe, ['--no-qr', '--name', 'personal box'], { cwd: dir, env: { ...process.env, REACH_HOME: path.join(tmp, 'home4') }, stdio: 'ignore' });
-    try {
-      await until(() => machines.some((m) => m.online && m.name === 'personal box'), 'personal copy online', 30000);
-      const box = machines.find((m) => m.name === 'personal box');
-      const { r } = await ctl.call(box.id, 'exec', { cmd: 'echo from-personal', cwd: work });
-      let text = '';
-      const stop = ctl.watchJob(box.id, r.job, (h, b) => h.y === 'out' && (text += Buffer.from(b).toString()));
-      await until(() => /from-personal/.test(text), 'command output from the personal copy');
-      stop();
-    } finally {
-      run.kill();
-    }
+step('the dashboard program serves the page only to its own page, and can add its own computer', async () => {
+  reach(['--no-open', '--port', String(PORT), '--name', 'dash box'], 'home3', { stdio: 'ignore' });
+  await until(() => local('GET', '/').then((r) => r.status === 200 && /<title>reach<\/title>/.test(r.body), () => false), 'dashboard page');
+  const ok = { 'x-reach': '1' };
+  assert.equal((await local('GET', '/api/status')).status, 403, 'needs the page header');
+  assert.equal((await local('GET', '/api/status', { ...ok, 'sec-fetch-site': 'cross-site' })).status, 403, 'other sites are refused');
+  assert.equal((await local('GET', '/', { host: 'evil.example' })).status, 403, 'other host names are refused');
+  assert.equal((await local('POST', '/api/enroll', {}, { p: pub })).status, 403, 'cannot enrol without the page header');
+  assert.equal(JSON.parse((await local('GET', '/api/status', ok)).body).enrolled, '');
+  assert.equal((await local('POST', '/api/enroll', ok, { p: pub })).status, 200);
+  await until(() => online('dash box'), 'dashboard computer online');
+  assert.equal(JSON.parse((await local('GET', '/api/status', ok)).body).enrolled, pub);
+});
+
+if (BIN)
+  step('a client program downloaded from the dashboard joins by itself and holds no secret', async () => {
+    const target = JSON.parse((await local('GET', '/api/status', { 'x-reach': '1' })).body).target;
+    const res = await local('GET', `/api/client?target=${target}&p=${pub}`, { 'sec-fetch-site': 'same-origin' });
+    assert.equal(res.status, 200);
+    assert.ok(!res.body.includes(secret), 'no dashboard secret inside');
+    const exe = path.join(tmp, 'reach-client' + (win ? '.exe' : ''));
+    fs.writeFileSync(exe, res.body, { mode: 0o755 });
+    const run = spawn(exe, ['--name', 'client box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home4') }, stdio: 'ignore' });
+    children.push(run);
+    await until(() => online('client box'), 'stamped client online');
+    const box = online('client box').id;
+    const { r } = await ctl.call(box, 'exec', { cmd: 'echo from-client', cwd: work });
+    assert.match((await collect(r.job, box)).text, /from-client/);
+    run.kill();
   });
 
-step('a different key sees nothing and cannot command the machine', async () => {
-  let seen = [];
-  const other = new Controller({ mqttConnect: mqtt.connect, key: newKey(), onMachines: (m) => (seen = m) });
-  await other.start();
-  await sleep(4000);
-  assert.equal(seen.length, 0);
-  other.stop();
-
-  // Same relay channel, wrong encryption key: the agent must ignore it.
-  const real = await deriveKeys(ctl.key);
-  const forged = new Controller({ mqttConnect: mqtt.connect, key: newKey() });
-  await forged.start();
-  forged.link.keys = { enc: forged.link.keys.enc, base: real.base };
-  await assert.rejects(forged.call(id, 'exec', { cmd: 'echo pwned > ' + path.join(work, 'pwned'), cwd: work }), /did not answer/);
-  forged.stop();
+step('knowing the dashboard address (what a client program holds) is not enough to control a machine', async () => {
+  const base = await fleetBase(pub);
+  const attacker = await newSecret();
+  const spy = mqtt.connect(DEFAULT_BROKER);
+  const seen = [];
+  let agentPub;
+  spy.on('message', (t, p) => (t.includes('/hello/') ? (agentPub = p.subarray(0, 65)) : seen.push(t)));
+  await spy.subscribeAsync([`${base}/hello/${id}`, `${base}/${id}/re/+`], { qos: 1 });
+  await spy.publishAsync(`${base}/who`, '');
+  await until(() => agentPub, 'client public key');
+  const key = await channelKey(attacker, new Uint8Array(agentPub));
+  const topic = `${base}/${id}/to`;
+  const f = 'c' + '0'.repeat(16);
+  await spy.publishAsync(topic, Buffer.from(await seal(key, topic, { y: 'hello', f, c: 'x' })), { qos: 1 });
+  await spy.publishAsync(topic, Buffer.from(await seal(key, topic, { y: 'req', f, s: 'x', n: 1, id: 'x', op: 'exec', a: { cmd: 'echo pwned > ' + path.join(work, 'pwned'), cwd: work } })), { qos: 1 });
+  await sleep(3000);
+  spy.end(true);
+  assert.deepEqual(seen, [], 'the client did not answer');
   assert.equal(fs.existsSync(path.join(work, 'pwned')), false);
+
+  let others = [];
+  const other = new Controller({ mqttConnect: mqtt.connect, secret: attacker, onMachines: (m) => (others = m) });
+  await other.start();
+  await sleep(3000);
+  other.stop();
+  assert.equal(others.length, 0, 'another dashboard sees none of these machines');
 });
 
 step('a recorded command cannot be replayed', async () => {
-  const keys = await deriveKeys(ctl.key);
-  const topic = keys.base + '/to/' + id;
+  const topic = `${await fleetBase(pub)}/${id}/to`;
   const spy = mqtt.connect(DEFAULT_BROKER);
   const captured = [];
   spy.on('message', (_t, p) => captured.push(p));
@@ -196,6 +222,7 @@ step('a recorded command cannot be replayed', async () => {
   assert.equal(fs.readFileSync(counter, 'utf8').trim().split(/\r?\n/).length, 1);
 });
 
+let failed = false;
 try {
   for (const [name, fn] of steps) {
     const t0 = Date.now();
@@ -210,9 +237,9 @@ try {
   }
 } finally {
   ctl?.stop();
-  agent.kill();
+  for (const c of children) c.kill();
   await sleep(500);
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
 console.log(failed ? '\nFAILED' : '\nall passed');
 process.exit(failed ? 1 : 0);

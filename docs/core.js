@@ -1,8 +1,14 @@
-// Shared by the agent (Node) and the dashboard (browser): crypto, framing, relay link, controller.
+// Shared by the programs (Node) and the dashboard page (browser): crypto, framing, relay link, controller.
+//
+// Roles. The dashboard owns a P-256 key pair. Its private half (the "secret") never leaves dashboard
+// devices. Clients are given only the public half. Each client makes its own key pair, and all traffic
+// with that client is encrypted with a key derived by ECDH between the two. Sending commands therefore
+// requires the dashboard secret: a client program cannot control other machines.
 
 export const DEFAULT_BROKER = 'wss://broker.hivemq.com:8884/mqtt';
 export const CHUNK = 48 * 1024;
 const WINDOW = 6;
+const EC = { name: 'ECDH', namedCurve: 'P-256' };
 
 const te = new TextEncoder();
 const td = new TextDecoder();
@@ -23,9 +29,40 @@ export const b64u = {
 
 const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 export const randId = (n = 8) => hex(crypto.getRandomValues(new Uint8Array(n)));
-export const newKey = () => b64u.enc(crypto.getRandomValues(new Uint8Array(32)));
+const sha256hex = async (bytes) => hex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
+const err = (message, code) => Object.assign(new Error(message), { code });
 
-// A relay address ends up in links and in commands people copy, so only plain ws(s) URLs are accepted.
+// ---------- identities ----------
+
+// A secret is d || x || y of a P-256 key (96 bytes); the matching public address is 0x04 || x || y (65 bytes).
+export async function newSecret() {
+  const pair = await crypto.subtle.generateKey(EC, true, ['deriveBits']);
+  const jwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  const out = new Uint8Array(96);
+  out.set(b64u.dec(jwk.d), 0);
+  out.set(b64u.dec(jwk.x), 32);
+  out.set(b64u.dec(jwk.y), 64);
+  return b64u.enc(out);
+}
+
+export function checkSecret(secret) {
+  if (!/^[A-Za-z0-9_-]{128}$/.test(String(secret))) throw new Error('That is not a valid dashboard key.');
+  return secret;
+}
+
+export function checkPublic(pub) {
+  if (!/^[A-Za-z0-9_-]{87}$/.test(String(pub)) || b64u.dec(pub)[0] !== 4) throw new Error('That is not a valid dashboard address.');
+  return pub;
+}
+
+export function publicOf(secret) {
+  const raw = new Uint8Array(65);
+  raw[0] = 4;
+  raw.set(b64u.dec(checkSecret(secret)).subarray(32), 1);
+  return b64u.enc(raw);
+}
+
+// A relay address ends up in links and in files people download, so only plain ws(s) URLs are accepted.
 export function checkBroker(broker) {
   if (!broker) return '';
   let ok = /^wss?:\/\/[A-Za-z0-9._~:@%/\[\]+-]+$/.test(broker);
@@ -38,38 +75,39 @@ export function checkBroker(broker) {
   return broker;
 }
 
-// Accepts a bare key or a dashboard link containing #k=<key>[&b=<broker>]. Throws unless both are well formed.
-export function parseKeyInput(input) {
+// Reads "#k=<secret>&b=<relay>" (dashboard link), "#p=<public>&b=<relay>" (client), or a bare secret.
+export function parseLink(input) {
   const s = String(input || '').trim();
   const i = s.indexOf('#');
-  let key = s;
-  let broker = '';
-  if (i >= 0 || s.includes('k=')) {
-    const p = new URLSearchParams(i >= 0 ? s.slice(i + 1) : s);
-    key = p.get('k') || '';
-    broker = p.get('b') || '';
-  }
-  if (!/^[A-Za-z0-9_-]{43}$/.test(key)) throw new Error('That is not a valid reach key.');
-  return { key, broker: checkBroker(broker) };
+  const p = new URLSearchParams(i >= 0 ? s.slice(i + 1) : s.includes('=') ? s : 'k=' + s);
+  const out = { broker: checkBroker(p.get('b') || '') };
+  if (p.get('k')) out.secret = checkSecret(p.get('k'));
+  else if (p.get('p')) out.pub = checkPublic(p.get('p'));
+  else throw new Error('That is not a valid dashboard key.');
+  return out;
 }
 
-export async function deriveKeys(keyStr) {
-  let raw;
-  try {
-    raw = b64u.dec(keyStr);
-  } catch {
-    raw = new Uint8Array(0);
-  }
-  if (raw.length !== 32) throw new Error('That is not a valid reach key.');
-  const hk = await crypto.subtle.importKey('raw', raw, 'HKDF', false, ['deriveKey', 'deriveBits']);
-  const params = (info) => ({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: te.encode(info) });
-  const enc = await crypto.subtle.deriveKey(params('reach/enc/v1'), hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-  const tid = new Uint8Array(await crypto.subtle.deriveBits(params('reach/topic/v1'), hk, 128));
-  return { enc, base: 'reach1/' + hex(tid) };
+export const fleetBase = async (pub) => 'reach2/' + (await sha256hex(b64u.dec(checkPublic(pub)))).slice(0, 32);
+export const agentIdOf = async (pubRaw) => (await sha256hex(pubRaw)).slice(0, 24);
+
+function importPrivate(secret) {
+  const b = b64u.dec(checkSecret(secret));
+  const jwk = { kty: 'EC', crv: 'P-256', d: b64u.enc(b.subarray(0, 32)), x: b64u.enc(b.subarray(32, 64)), y: b64u.enc(b.subarray(64)) };
+  return crypto.subtle.importKey('jwk', jwk, EC, false, ['deriveBits']);
 }
+
+// The AES key shared by one dashboard and one client. Either side derives it from its own secret and the other's public key.
+export async function channelKey(secret, peerPubRaw) {
+  const peer = await crypto.subtle.importKey('raw', peerPubRaw, EC, false, []);
+  const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, await importPrivate(secret), 256);
+  const hk = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: te.encode('reach/channel/v2') }, hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+// ---------- framing ----------
 
 // Wire format: iv(12) || AES-256-GCM( u32 headerLength || header JSON || body ), with the topic as AAD.
-async function seal(keys, topic, header, body) {
+export async function seal(key, topic, header, body) {
   const hdr = te.encode(JSON.stringify(header));
   const b = body ? new Uint8Array(body.buffer ? body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) : body) : new Uint8Array(0);
   const plain = new Uint8Array(4 + hdr.length + b.length);
@@ -77,18 +115,18 @@ async function seal(keys, topic, header, body) {
   plain.set(hdr, 4);
   plain.set(b, 4 + hdr.length);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(topic) }, keys.enc, plain));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(topic) }, key, plain));
   const out = new Uint8Array(12 + ct.length);
   out.set(iv);
   out.set(ct, 12);
   return out;
 }
 
-async function unseal(keys, topic, payload) {
+export async function unseal(key, topic, payload) {
   try {
     const p = new Uint8Array(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
     if (p.length < 12 + 16 + 4) return null;
-    const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: p.subarray(0, 12), additionalData: te.encode(topic) }, keys.enc, p.subarray(12)));
+    const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: p.subarray(0, 12), additionalData: te.encode(topic) }, key, p.subarray(12)));
     const n = new DataView(plain.buffer).getUint32(0);
     if (n > plain.length - 4) return null;
     return { h: JSON.parse(td.decode(plain.subarray(4, 4 + n))), body: plain.subarray(4 + n) };
@@ -97,12 +135,13 @@ async function unseal(keys, topic, payload) {
   }
 }
 
-// One encrypted connection to the relay. Messages are sent and delivered strictly in order.
+// ---------- relay link ----------
+
+// One connection to the relay. Messages are published and handed to route() strictly in order.
 export class Link {
-  static async open({ mqttConnect, broker, keys, subscribe, will, onStatus }) {
+  // will: { topic, payload } prepared by the caller. route(topic, payload) may be async.
+  static open({ mqttConnect, broker, subscribe, will, onStatus, route }) {
     const link = new Link();
-    link.keys = keys;
-    link.handlers = [];
     link.tx = Promise.resolve();
     link.rx = Promise.resolve();
     link.unacked = 0;
@@ -110,13 +149,10 @@ export class Link {
     // Resolves once the relay has confirmed the subscriptions, so replies cannot be missed.
     link.ready = new Promise((r) => (ready = r));
     const opts = { clientId: 'reach_' + randId(8), clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 15000 };
-    if (will) {
-      const topic = link.topic(will.suffix);
-      opts.will = { topic, payload: await seal(keys, topic, will.header), qos: 1, retain: false };
-    }
+    if (will) opts.will = { ...will, qos: 1, retain: false };
     const client = (link.client = mqttConnect(broker || DEFAULT_BROKER, opts));
     client.on('connect', () => {
-      client.subscribe(subscribe.map((s) => link.topic(s)), { qos: 1 }, () => {
+      client.subscribe(subscribe, { qos: 1 }, () => {
         ready();
         onStatus?.('online');
       });
@@ -124,18 +160,7 @@ export class Link {
     client.on('close', () => onStatus?.('offline'));
     client.on('error', () => {});
     client.on('message', (topic, payload) => {
-      link.rx = link.rx.then(async () => {
-        const m = await unseal(keys, topic, payload);
-        if (!m) return;
-        const suffix = topic.slice(keys.base.length + 1);
-        for (const [match, fn] of link.handlers) {
-          if (match === suffix || (match.endsWith('/') && suffix.startsWith(match))) {
-            try {
-              fn(m.h, m.body, suffix);
-            } catch {}
-          }
-        }
-      });
+      link.rx = link.rx.then(() => route(topic, payload)).catch(() => {});
     });
     return link;
   }
@@ -144,24 +169,15 @@ export class Link {
     return this.client.connected;
   }
 
-  topic(suffix) {
-    return this.keys.base + '/' + suffix;
-  }
-
-  // match: exact suffix, or a prefix ending in "/".
-  on(match, fn) {
-    this.handlers.push([match, fn]);
-  }
-
-  send(suffix, header, body, qos = 1) {
-    const topic = this.topic(suffix);
+  // make: async () => Uint8Array
+  publish(topic, make, qos = 1) {
     const p = this.tx.then(async () => {
-      const payload = await seal(this.keys, topic, header, body);
+      const payload = await make();
       this.unacked++;
       return new Promise((resolve, reject) => {
-        this.client.publish(topic, payload, { qos }, (err) => {
+        this.client.publish(topic, payload, { qos }, (e) => {
           this.unacked--;
-          err ? reject(err) : resolve();
+          e ? reject(e) : resolve();
         });
       });
     });
@@ -169,14 +185,16 @@ export class Link {
     return p;
   }
 
+  send(key, topic, header, body, qos = 1) {
+    return this.publish(topic, () => seal(key, topic, header, body), qos);
+  }
+
   close() {
     this.client.end(true);
   }
 }
 
-const err = (message, code) => Object.assign(new Error(message), { code });
-
-// ---------- pairing: hand the key to a new machine using a one-time code shown on its screen ----------
+// ---------- pairing: tell a new client which dashboard it belongs to, using a one-time code on its screen ----------
 
 const PAIR_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
@@ -191,30 +209,35 @@ export function normalizePairCode(input) {
   return c.slice(0, 4) + '-' + c.slice(4, 8) + '-' + c.slice(8);
 }
 
-// The code (60 random bits) is stretched so that a recorded pairing cannot be brute-forced later.
+// The code (60 random bits) is stretched, so only someone who saw it can make the client accept a dashboard.
 async function pairKeys(code) {
   const base = await crypto.subtle.importKey('raw', te.encode(normalizePairCode(code)), 'PBKDF2', false, ['deriveBits']);
-  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('reach/pair/v1'), iterations: 300000 }, base, 384));
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('reach/pair/v2'), iterations: 300000 }, base, 384));
   const enc = await crypto.subtle.importKey('raw', bits.subarray(16), 'AES-GCM', false, ['encrypt', 'decrypt']);
-  return { enc, base: 'reach1p/' + hex(bits.subarray(0, 16)) };
+  return { enc, base: 'reach2p/' + hex(bits.subarray(0, 16)) };
 }
 
-// New machine: waits until a dashboard that knows the code sends the key. Returns { promise, cancel }.
+// Client: waits until a dashboard that knows the code introduces itself. Returns { promise -> { pub, broker }, cancel }.
 export function pairWait({ mqttConnect, broker, code, name }) {
   let link;
   let cancelled = false;
   const promise = (async () => {
     const keys = await pairKeys(code);
-    link = await Link.open({ mqttConnect, broker, keys, subscribe: ['offer'] });
-    if (cancelled) link.close();
     const offer = await new Promise((resolve) => {
-      link.on('offer', (h) => {
-        try {
-          resolve(parseKeyInput('#' + new URLSearchParams({ k: h.key, ...(h.broker ? { b: h.broker } : {}) })));
-        } catch {}
+      link = Link.open({
+        mqttConnect,
+        broker,
+        subscribe: [keys.base + '/offer'],
+        route: async (topic, payload) => {
+          const m = await unseal(keys.enc, topic, payload);
+          try {
+            if (m) resolve({ pub: checkPublic(m.h.p), broker: checkBroker(m.h.b || '') });
+          } catch {}
+        },
       });
+      if (cancelled) link.close();
     });
-    await link.send('ack', { y: 'ack', name }).catch(() => {});
+    await link.send(keys.enc, keys.base + '/ack', { y: 'ack', name }).catch(() => {});
     link.close();
     return offer;
   })();
@@ -227,33 +250,49 @@ export function pairWait({ mqttConnect, broker, code, name }) {
   };
 }
 
-// Dashboard: sends the key to the machine showing this code. Resolves with the machine's name.
-export async function pairOffer({ mqttConnect, broker, code, secret, timeout = 45000 }) {
+// Dashboard: introduces itself to the client showing this code. Resolves with the client's name.
+export async function pairOffer({ mqttConnect, broker, code, pub, timeout = 45000 }) {
   const keys = await pairKeys(code);
-  const link = await Link.open({ mqttConnect, broker, keys, subscribe: ['ack'] });
   let timer;
   let retry;
+  let link;
   try {
     return await new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(err('No machine answered for that code. Check the code and that the machine is still waiting.', 'TIMEOUT')), timeout);
-      link.on('ack', (h) => resolve(String(h.name || 'machine')));
-      const offer = () => link.ready.then(() => link.send('offer', { y: 'offer', key: secret.key, broker: secret.broker || '' })).catch(() => {});
+      link = Link.open({
+        mqttConnect,
+        broker,
+        subscribe: [keys.base + '/ack'],
+        route: async (topic, payload) => {
+          const m = await unseal(keys.enc, topic, payload);
+          if (m) resolve(String(m.h.name || 'machine'));
+        },
+      });
+      const offer = () => link.ready.then(() => link.send(keys.enc, keys.base + '/offer', { y: 'offer', p: pub, b: broker || '' })).catch(() => {});
       retry = setInterval(offer, 2500);
       offer();
     });
   } finally {
     clearTimeout(timer);
     clearInterval(retry);
-    link.close();
+    link?.close();
   }
 }
 
-// Talks to agents: discovery, request/response, file transfer, job output.
+// ---------- controller (dashboard side) ----------
+
+// Topics under base = reach2/<hash of dashboard public key>:
+//   who                 anyone -> clients: "announce yourselves" (empty, harmless)
+//   hello/<aid>         client -> dashboard: client public key (65 bytes) || sealed presence
+//   <aid>/to            dashboard -> client: sealed requests
+//   <aid>/re/<ctl>      client -> one dashboard session: sealed replies
+//   <aid>/out           client -> dashboards: sealed job output
 export class Controller {
-  constructor({ mqttConnect, broker, key, onMachines, onStatus }) {
-    Object.assign(this, { mqttConnect, broker, key, onMachines, onStatus });
+  constructor({ mqttConnect, broker, secret, onMachines, onStatus }) {
+    Object.assign(this, { mqttConnect, broker, secret, onMachines, onStatus });
     this.id = 'c' + randId(8);
     this.machines = new Map();
+    this.keys = new Map();
     this.sessions = new Map();
     this.hellos = new Map();
     this.pending = new Map();
@@ -261,20 +300,18 @@ export class Controller {
   }
 
   async start() {
-    const keys = await deriveKeys(this.key);
-    this.link = await Link.open({
+    this.pub = publicOf(this.secret);
+    const base = (this.base = await fleetBase(this.pub));
+    this.link = Link.open({
       mqttConnect: this.mqttConnect,
       broker: this.broker,
-      keys,
-      subscribe: ['pres', 'to/' + this.id, 'out/+'],
+      subscribe: [`${base}/hello/+`, `${base}/+/re/${this.id}`, `${base}/+/out`],
+      route: (topic, payload) => this._route(topic, payload),
       onStatus: (s) => {
-        if (s === 'online') this.link?.send('who', { y: 'who', f: this.id }, null, 0).catch(() => {});
+        if (s === 'online') this.link.publish(`${base}/who`, async () => new Uint8Array(0), 0).catch(() => {});
         this.onStatus?.(s);
       },
     });
-    this.link.on('pres', (h) => this._presence(h));
-    this.link.on('to/' + this.id, (h, body) => this._inbox(h, body));
-    this.link.on('out/', (h, body, suffix) => this._out(suffix.slice(4), h, body));
     this.sweep = setInterval(() => this._sweep(), 5000);
   }
 
@@ -283,15 +320,45 @@ export class Controller {
     this.link?.close();
   }
 
-  _presence(h) {
-    if (typeof h.id !== 'string' || Math.abs(Date.now() - h.ts) > 10 * 60 * 1000) return;
+  async _route(topic, payload) {
+    const parts = topic.slice(this.base.length + 1).split('/');
+    if (parts[0] === 'hello') {
+      const aid = parts[1];
+      if (payload.length < 65) return;
+      const pubRaw = new Uint8Array(payload.subarray(0, 65));
+      let key = this.keys.get(aid);
+      if (!key) {
+        // The id is the hash of the client's public key, so a client cannot claim another client's id.
+        if ((await agentIdOf(pubRaw)) !== aid) return;
+        try {
+          key = await channelKey(this.secret, pubRaw);
+        } catch {
+          return;
+        }
+        this.keys.set(aid, key);
+      }
+      const m = await unseal(key, topic, payload.subarray(65));
+      if (m) this._presence(aid, m.h);
+      return;
+    }
+    const aid = parts[0];
+    const key = this.keys.get(aid);
+    if (!key) return;
+    const m = await unseal(key, topic, payload);
+    if (!m) return;
+    if (parts[1] === 're') this._inbox(aid, m.h, m.body);
+    else if (parts[1] === 'out') for (const fn of this.jobWatchers.get(aid + '/' + m.h.job) || []) fn(m.h, m.body);
+  }
+
+  _presence(aid, h) {
+    if (Math.abs(Date.now() - h.ts) > 10 * 60 * 1000) return;
     if (h.y === 'bye') {
-      const m = this.machines.get(h.id);
+      const m = this.machines.get(aid);
       if (m && m.boot === h.boot) m.seen = 0;
     } else if (h.y === 'pres') {
-      const prev = this.machines.get(h.id);
-      if (prev && prev.boot !== h.boot) this.sessions.delete(h.id);
-      this.machines.set(h.id, { id: h.id, name: String(h.name), os: String(h.os), host: String(h.host), boot: h.boot, seen: Date.now() });
+      const prev = this.machines.get(aid);
+      if (prev && prev.boot !== h.boot) this.sessions.delete(aid);
+      this.machines.set(aid, { id: aid, name: String(h.name), os: String(h.os), host: String(h.host), boot: h.boot, seen: Date.now() });
     }
     this._sweep();
   }
@@ -302,16 +369,16 @@ export class Controller {
     this.onMachines?.(list);
   }
 
-  _inbox(h, body) {
+  _inbox(aid, h, body) {
     if (h.y === 'welcome') {
       const w = this.hellos.get(h.c);
-      if (w && w.agent === h.f) w.resolve(h);
+      if (w && w.agent === aid) w.resolve(h);
       return;
     }
     const p = this.pending.get(h.id);
-    if (!p || p.agent !== h.f) return;
+    if (!p || p.agent !== aid) return;
     if (h.y === 'nosession') {
-      this.sessions.delete(p.agent);
+      this.sessions.delete(aid);
       p.reject(err('session expired', 'NOSESSION'));
     } else if (h.y === 'res') {
       h.ok ? p.resolve({ r: h.r, body }) : p.reject(err(h.e || 'failed', 'REMOTE'));
@@ -320,9 +387,10 @@ export class Controller {
     }
   }
 
-  _out(agent, h, body) {
-    if (h.f !== agent) return;
-    for (const fn of this.jobWatchers.get(agent + '/' + h.job) || []) fn(h, body);
+  _send(agent, header, body) {
+    const key = this.keys.get(agent);
+    if (!key) return Promise.reject(err('That machine is not known yet.', 'UNKNOWN'));
+    return this.link.send(key, `${this.base}/${agent}/to`, header, body);
   }
 
   async _session(agent) {
@@ -332,7 +400,7 @@ export class Controller {
     const welcome = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(err('The machine did not answer. Is reach still running on it?', 'TIMEOUT')), 10000);
       this.hellos.set(c, { agent, resolve: (h) => (clearTimeout(timer), resolve(h)) });
-      this.link.send('to/' + agent, { y: 'hello', f: this.id, c }).catch(reject);
+      this._send(agent, { y: 'hello', f: this.id, c }).catch(reject);
     }).finally(() => this.hellos.delete(c));
     s = { s: welcome.s, n: 0, info: welcome.info };
     this.sessions.set(agent, s);
@@ -354,7 +422,7 @@ export class Controller {
         const res = await new Promise((resolve, reject) => {
           timer = setTimeout(() => reject(err('The machine did not answer in time.', 'TIMEOUT')), timeout);
           this.pending.set(id, { agent, resolve, reject, onEv });
-          this.link.send('to/' + agent, { y: 'req', f: this.id, s: sess.s, n: ++sess.n, id, op, a }, body).catch(reject);
+          this._send(agent, { y: 'req', f: this.id, s: sess.s, n: ++sess.n, id, op, a }, body).catch(reject);
         });
         if (!keep) done();
         return { ...res, id, done };

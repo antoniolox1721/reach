@@ -122,3 +122,10 @@ code, .mono { font-family: var(--mono); font-size: 13px; }
 #toasts { position: fixed; top: 60px; left: 10px; right: 10px; z-index: 30; display: flex; flex-direction: column; gap: 6px; align-items: center; pointer-events: none; }
 .toast { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; max-width: 700px; overflow-wrap: anywhere; }
 .toast.bad { border-color: var(--warn); }
+
+h3 { font-size: 14px; margin: 18px 0 4px; }
+a.button { display: inline-block; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 9px 14px; color: var(--text); text-decoration: none; }
+.center { text-align: center; }
+.bigcode { font-size: 26px; letter-spacing: 2px; margin: 14px 0; }
+canvas.qr { border-radius: 8px; max-width: 100%; height: auto; }
+.sheet.center button { text-align: center; }

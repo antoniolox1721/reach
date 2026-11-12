@@ -1,7 +1,7 @@
 {
   "name": "reach",
-  "version": "0.1.2",
-  "description": "Run it on any machine and control it from any other: files, commands and saved scripts, end-to-end encrypted, no VPN or port forwarding.",
+  "version": "0.2.0",
+  "description": "A password-protected dashboard for your machines: files, commands and saved scripts. Client programs only add a machine; end-to-end encrypted, no VPN or port forwarding.",
   "type": "module",
   "bin": {
     "reach": "reach.js"
@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "esbuild": "^0.28.2",
-    "postject": "^1.0.0-alpha.6"
+    "postject": "^1.0.0-alpha.6",
+    "qrcode-generator": "^2.0.4"
   }
 }
