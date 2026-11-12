@@ -9,12 +9,21 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 import qrcode from 'qrcode-terminal';
+import readline from 'node:readline';
+import { Link, deriveKeys, newKey, newPairCode, pairWait, parseKeyInput, checkBroker, randId, CHUNK, DEFAULT_BROKER } from './docs/core.js';
 
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
-const { Link, deriveKeys, newKey, parseKeyInput, randId, CHUNK, DEFAULT_BROKER } = await import('./docs/core.js');
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const PKG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+// In the standalone executables build.mjs embeds the dashboard files and package info as these globals.
+const PACKED = typeof __REACH_ASSETS__ !== 'undefined' ? __REACH_ASSETS__ : null;
+const ROOT = PACKED ? path.dirname(process.execPath) : path.dirname(fileURLToPath(import.meta.url));
+const PKG = PACKED ? __REACH_PKG__ : JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+const KEYFILE = 'reach.key';
+if (PACKED) {
+  // Set by the build banner for the bundled ws library; not meant for the commands we start.
+  delete process.env.WS_NO_BUFFER_UTIL;
+  delete process.env.WS_NO_UTF_8_VALIDATE;
+}
 const HOME_DIR = process.env.REACH_HOME || path.join(os.homedir(), '.reach');
 const CONFIG = path.join(HOME_DIR, 'config.json');
 const RING = 1024 * 1024;
@@ -54,8 +63,10 @@ function parseArgs(argv) {
 
 const HELP = `reach ${PKG.version} - control your machines from any of your machines
 
-  reach                 put this machine online (creates your key on first run)
+  reach                 put this machine online (first run: shows a pairing code for your dashboard)
+  reach new             first machine: create a new key and dashboard
   reach join <key>      add this machine using the key (or dashboard link) from another one
+  reach keyfile         write reach.key here; a copy of reach started next to that file joins by itself
   reach link            show the dashboard link, QR code and join command again
   reach ui [port]       serve the dashboard from this machine instead of the public page
   reach name <name>     rename this machine
@@ -77,7 +88,8 @@ function printAccess(cfg, noQr) {
   const link = dashboardLink(cfg);
   console.log('\nOpen the dashboard on any device (scan with your phone):\n\n  ' + link + '\n');
   if (!noQr) qrcode.generate(link, { small: true }, (q) => console.log(q.replace(/^/gm, '  ')));
-  console.log('Add another machine:\n\n  npx github:antoniolox1721/reach join ' + cfg.key + (cfg.broker ? ' --broker ' + cfg.broker : '') + '\n');
+  console.log('Add another machine: start reach on it and enter the code it shows under "Add a machine" in the dashboard.');
+  console.log('Or join directly with the key:\n\n  reach join ' + cfg.key + (cfg.broker ? ' --broker ' + cfg.broker : '') + '\n');
   console.log('Keep the key secret. Anyone who has it can read files and run commands on every machine.\n');
 }
 
@@ -479,17 +491,53 @@ function serveUi(cfg, port) {
   http
     .createServer((req, res) => {
       const rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-      const file = path.join(docs, rel === '/' ? 'index.html' : rel);
+      const name = rel === '/' ? 'index.html' : rel.slice(1);
+      const send = (data) => res.writeHead(200, { 'content-type': types[path.extname(name)], 'cache-control': 'no-store' }).end(data);
+      if (PACKED) return Object.hasOwn(PACKED, name) ? send(PACKED[name]) : res.writeHead(404).end();
+      const file = path.join(docs, name);
       if (!file.startsWith(docs + path.sep) || !types[path.extname(file)]) return res.writeHead(404).end();
-      fs.readFile(file, (e, data) => {
-        if (e) return res.writeHead(404).end();
-        res.writeHead(200, { 'content-type': types[path.extname(file)], 'cache-control': 'no-store' }).end(data);
-      });
+      fs.readFile(file, (e, data) => (e ? res.writeHead(404).end() : send(data)));
     })
     .listen(port, '127.0.0.1', () => {
       const base = `http://127.0.0.1:${port}/`;
       console.log('Dashboard on this machine only:\n\n  ' + (cfg.key ? dashboardLink(cfg, base) : base) + '\n');
     });
+}
+
+// ---------- first run: get the key ----------
+
+// A reach.key file next to the program (or in the current folder) lets a copied program join by itself.
+function readKeyFile() {
+  for (const dir of new Set([ROOT, process.cwd()])) {
+    try {
+      return parseKeyInput(fs.readFileSync(path.join(dir, KEYFILE), 'utf8'));
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw new Error(`${path.join(dir, KEYFILE)}: ${e.message}`);
+    }
+  }
+  return null;
+}
+
+// Shows a one-time code and waits for a dashboard to approve it. Enter creates a new dashboard instead.
+async function pairOrCreate(cfg, flags) {
+  const code = newPairCode();
+  const link = (cfg.dashboard || PKG.homepage) + '#pair=' + code;
+  console.log(`\nThis machine ("${cfg.name}") is not on a dashboard yet.\n`);
+  console.log('To add it: open your dashboard, choose "Add a machine" and enter this code:\n\n    ' + code + '\n');
+  if (!flags.noQr) {
+    console.log('or scan this with the phone that already has your dashboard:\n');
+    qrcode.generate(link, { small: true }, (q) => console.log(q.replace(/^/gm, '  ')));
+  }
+  const tty = process.stdin.isTTY;
+  if (tty) console.log('First machine? Press Enter to create a new dashboard instead.\n');
+  const wait = pairWait({ mqttConnect: mqtt.connect, broker: cfg.broker, code, name: cfg.name });
+  const rl = tty ? readline.createInterface({ input: process.stdin }) : null;
+  const enter = new Promise((resolve) => rl?.once('line', () => resolve(null)));
+  const got = await Promise.race([wait.promise, enter]);
+  rl?.close();
+  wait.cancel();
+  if (got) console.log('Approved from your dashboard.\n');
+  return got || { key: newKey(), broker: '' };
 }
 
 // ---------- cli ----------
@@ -508,7 +556,7 @@ async function main() {
     }
   };
   set('name', flags.name);
-  set('broker', flags.broker);
+  set('broker', flags.broker === undefined ? undefined : checkBroker(flags.broker));
   set('dashboard', flags.dashboard);
   if (!cfg.id) set('id', 'm' + randId(6));
   if (!cfg.name) set('name', os.hostname());
@@ -523,13 +571,27 @@ async function main() {
   } else if (cmd === 'name') {
     if (!rest[1]) throw new Error('Usage: reach name <name>');
     set('name', rest.slice(1).join(' '));
-  } else if (cmd === 'up' && !cfg.key) {
+  } else if (cmd === 'new') {
+    if (cfg.key) throw new Error('This machine already has a key. Use "reach rekey" to replace it.');
     set('key', newKey());
   }
   if (cfg.broker === DEFAULT_BROKER) set('broker', '');
+  checkBroker(cfg.broker);
+  if (cfg.key) parseKeyInput(cfg.key);
+  if (cmd === 'up' && !cfg.key) {
+    const got = readKeyFile() || (await pairOrCreate(cfg, flags));
+    set('key', got.key);
+    if (got.broker) set('broker', got.broker);
+  }
   if (dirty) saveConfig(cfg);
 
-  if (cmd === 'up' || cmd === 'join') return runAgent(cfg, flags);
+  if (cmd === 'up' || cmd === 'join' || cmd === 'new') return runAgent(cfg, flags);
+  if (cmd === 'keyfile') {
+    if (!cfg.key) throw new Error('No key yet. Run "reach" first.');
+    const link = '#' + new URLSearchParams({ k: cfg.key, ...(cfg.broker ? { b: cfg.broker } : {}) });
+    fs.writeFileSync(KEYFILE, link + '\n', { mode: 0o600 });
+    return console.log(`Wrote ${path.resolve(KEYFILE)}. Keep it secret. Put it in the same folder as the reach program on another machine and start it.`);
+  }
   if (cmd === 'ui') return serveUi(cfg, Number(rest[1]) || 7700);
   if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}". Restart reach to apply.`);
   if (cmd === 'link' || cmd === 'rekey') {

@@ -66,6 +66,7 @@ input, textarea {
 input:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 label { display: block; color: var(--dim); font-size: 13px; margin: 12px 0 4px; }
 p { margin: 8px 0; }
+a { color: var(--accent); }
 .dim { color: var(--dim); }
 .small { font-size: 13px; }
 .error { color: var(--warn); min-height: 1.4em; }

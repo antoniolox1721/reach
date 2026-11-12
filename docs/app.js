@@ -1,4 +1,4 @@
-import { Controller, parseKeyInput, deriveKeys, b64u } from './core.js';
+import { Controller, parseKeyInput, deriveKeys, pairOffer, normalizePairCode, b64u } from './core.js';
 
 const VAULT = 'reach.vault';
 const PBKDF2_ITERATIONS = 600000;
@@ -74,6 +74,7 @@ let secret = null;
 let machines = [];
 let current = null; // { id, name, info, tab, files, term }
 let screen = 'boot';
+let pendingPair = null; // pairing code that arrived in the link, handled after unlock
 
 function setHeader(title, back) {
   $('#title').textContent = title;
@@ -147,6 +148,7 @@ function showUnlock() {
 function showSetup(prefill, broker = '') {
   screen = 'setup';
   setHeader('reach', false);
+  const hadVault = !!localStorage.getItem(VAULT);
   const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Key or dashboard link', value: prefill });
   const pw1 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters' });
   const pw2 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'Repeat the password' });
@@ -178,8 +180,10 @@ function showSetup(prefill, broker = '') {
       'div',
       { class: 'card' },
       prefill
-        ? h('p', null, 'Key received. Choose a password for this device. You will type it each time you open this page.')
+        ? h('p', null, 'Key received from the link. Only continue if this link came from your own machine: the dashboard will control whatever machines use that key. Choose a password for this device. You will type it each time you open this page.')
         : h('p', null, 'Run ', h('code', null, 'reach'), ' on one of your machines, then open the link it prints (or paste the key here).'),
+      prefill && hadVault && h('p', { class: 'error' }, 'This device already has a saved key. Continuing replaces it with the key from the link.'),
+      broker && h('p', { class: 'small' }, 'This link uses a custom relay: ', h('code', null, broker)),
       h('label', null, 'Key'),
       key,
       h('label', null, 'Password for this device'),
@@ -187,7 +191,7 @@ function showSetup(prefill, broker = '') {
       h('label', null, 'Repeat password'),
       pw2,
       msg,
-      h('div', { class: 'row' }, go)
+      h('div', { class: 'row' }, go, prefill && hadVault && h('button', { type: 'button', onclick: showUnlock }, 'Keep my saved key'))
     ),
     h('p', { class: 'dim small' }, 'The key never leaves this device unencrypted: it is stored here locked with your password, and this page has no server.')
   );
@@ -209,6 +213,29 @@ async function connect(s) {
   });
   await ctl.start();
   showMachines();
+  if (pendingPair) {
+    const code = pendingPair;
+    pendingPair = null;
+    addMachine(code);
+  }
+}
+
+// Sends the key to the machine that is showing this one-time code.
+async function addMachine(input) {
+  let code;
+  try {
+    code = normalizePairCode(input);
+  } catch (e) {
+    return fail(e);
+  }
+  if (!confirm(`Add the machine showing code ${code}?\n\nOnly continue if you can see this exact code on a machine you just started yourself. That machine gets your key: it joins your dashboard and whoever controls it can reach all your machines.`)) return;
+  toast('Looking for the machine…');
+  try {
+    const name = await pairOffer({ mqttConnect: window.mqtt.connect, broker: secret.broker || undefined, code, secret });
+    toast(`Added "${name}". It will appear in the list in a moment.`);
+  } catch (e) {
+    fail(e);
+  }
 }
 
 // ---------- machine list ----------
@@ -225,7 +252,28 @@ function showMachines() {
     )
   );
   const joinCmd = 'npx github:antoniolox1721/reach join ' + secret.key + (secret.broker ? ' --broker ' + secret.broker : '');
-  const reveal = h('div', { hidden: true }, h('p', { class: 'dim small' }, 'Run this on the machine you want to add (needs Node.js). It contains your key, so do not share it.'), h('div', { class: 'cmdbox mono' }, joinCmd));
+  const keyBox = h('div', { hidden: true }, h('p', { class: 'dim small' }, 'With Node.js installed you can also run this on the new machine. It contains your key, so do not share it.'), h('div', { class: 'cmdbox mono' }, joinCmd));
+  const codeInput = h('input', { class: 'mono', placeholder: 'XXXX-XXXX-XXXX', 'aria-label': 'Pairing code', autocapitalize: 'characters', autocomplete: 'off', spellcheck: 'false' });
+  const reveal = h(
+    'div',
+    { hidden: true },
+    h('p', { class: 'small' }, '1. On the new machine, download and start reach: ', h('a', { href: 'https://github.com/antoniolox1721/reach/releases/latest', target: '_blank', rel: 'noopener noreferrer' }, 'get the program'), '.'),
+    h('p', { class: 'small' }, '2. It shows a code. Type it here (or scan its QR code with this phone).'),
+    h(
+      'form',
+      {
+        class: 'row',
+        onsubmit: (e) => {
+          e.preventDefault();
+          addMachine(codeInput.value);
+        },
+      },
+      codeInput,
+      h('button', { class: 'primary', type: 'submit' }, 'Add')
+    ),
+    h('p', null, h('button', { class: 'ghost small', onclick: () => (keyBox.hidden = !keyBox.hidden) }, 'Use the key instead')),
+    keyBox
+  );
   view.replaceChildren(
     h(
       'div',
@@ -802,11 +850,22 @@ function boot() {
     view.replaceChildren(h('div', { class: 'pad' }, h('div', { class: 'card' }, 'This page needs HTTPS (or http://127.0.0.1) to do encryption.')));
     return;
   }
-  const fromLink = location.hash.length > 1 ? parseKeyInput(location.hash) : null;
+  let fromLink = null;
+  try {
+    const pair = new URLSearchParams(location.hash.slice(1)).get('pair');
+    if (pair) pendingPair = normalizePairCode(pair);
+    else if (location.hash.length > 1) fromLink = parseKeyInput(location.hash);
+  } catch (e) {
+    toast('The link is not valid: ' + e.message, true);
+  }
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);
   if (fromLink?.key) showSetup(fromLink.key, fromLink.broker);
   else if (localStorage.getItem(VAULT)) showUnlock();
-  else showSetup('');
+  else {
+    if (pendingPair) toast('Set up your dashboard on this device first, then scan the code again.', true);
+    pendingPair = null;
+    showSetup('');
+  }
 }
 
 boot();

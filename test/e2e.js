@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
-const { Controller, newKey, deriveKeys, DEFAULT_BROKER } = await import('../docs/core.js');
+const { Controller, newKey, deriveKeys, pairOffer, DEFAULT_BROKER } = await import('../docs/core.js');
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reach-test-'));
@@ -17,13 +17,15 @@ const home = path.join(tmp, 'home');
 const work = path.join(tmp, 'work');
 fs.mkdirSync(work);
 const win = process.platform === 'win32';
+// REACH_BIN=<path to a built executable> tests that instead of the source.
+const reach = (args, opts) => (process.env.REACH_BIN ? spawn(path.resolve(process.env.REACH_BIN), args, opts) : spawn(process.execPath, [path.join(root, 'reach.js'), ...args], opts));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (fn, what, ms = 15000) => {
   for (const t0 = Date.now(); Date.now() - t0 < ms; await sleep(100)) if (await fn()) return;
   throw new Error('timed out waiting for ' + what);
 };
 
-const agent = spawn(process.execPath, [path.join(root, 'reach.js'), '--no-qr', '--name', 'test box'], { env: { ...process.env, REACH_HOME: home }, stdio: 'ignore' });
+const agent = reach(['new', '--no-qr', '--name', 'test box'], { env: { ...process.env, REACH_HOME: home }, stdio: 'ignore' });
 let failed = false;
 const steps = [];
 const step = (name, fn) => steps.push([name, fn]);
@@ -110,6 +112,31 @@ step('saved scripts persist on the machine', async () => {
   await ctl.call(id, 'scripts.set', { scripts: [{ name: 'hello', cmd: 'echo hi', cwd: work }] });
   assert.deepEqual((await ctl.call(id, 'scripts.get')).r, [{ name: 'hello', cmd: 'echo hi', cwd: work }]);
   assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')).scripts[0].name, 'hello');
+});
+
+step('a new machine joins with a pairing code, another with a key file', async () => {
+  const home2 = path.join(tmp, 'home2');
+  const second = reach(['--no-qr', '--name', 'paired box'], { env: { ...process.env, REACH_HOME: home2 }, stdio: ['ignore', 'pipe', 'ignore'] });
+  let out = '';
+  second.stdout.on('data', (d) => (out += d));
+  try {
+    await until(() => /[2-9A-Z]{4}-[2-9A-Z]{4}-[2-9A-Z]{4}/.test(out), 'pairing code');
+    const code = out.match(/[2-9A-Z]{4}-[2-9A-Z]{4}-[2-9A-Z]{4}/)[0];
+    assert.equal(await pairOffer({ mqttConnect: mqtt.connect, code, secret: { key: ctl.key, broker: '' } }), 'paired box');
+    await until(() => machines.some((m) => m.online && m.name === 'paired box'), 'paired machine online', 30000);
+  } finally {
+    second.kill();
+  }
+
+  const dir3 = path.join(tmp, 'usb');
+  fs.mkdirSync(dir3);
+  fs.writeFileSync(path.join(dir3, 'reach.key'), '#k=' + ctl.key + '\n');
+  const third = reach(['--no-qr', '--name', 'keyfile box'], { cwd: dir3, env: { ...process.env, REACH_HOME: path.join(tmp, 'home3') }, stdio: 'ignore' });
+  try {
+    await until(() => machines.some((m) => m.online && m.name === 'keyfile box'), 'key file machine online', 30000);
+  } finally {
+    third.kill();
+  }
 });
 
 step('a different key sees nothing and cannot command the machine', async () => {

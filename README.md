@@ -8,52 +8,44 @@ Run one command on each of your machines (PC, laptop, phone) and control any of 
 
 ## Quick start
 
-You need [Node.js](https://nodejs.org) 18 or newer and git on each machine.
+**1. Get the program** on each machine. No installation, nothing else needed:
 
-**1. On the first machine**
+| Machine | Download |
+| --- | --- |
+| Windows | [reach-windows-x64.exe](https://github.com/antoniolox1721/reach/releases/latest/download/reach-windows-x64.exe) |
+| Linux | [reach-linux-x64](https://github.com/antoniolox1721/reach/releases/latest/download/reach-linux-x64) or [reach-linux-arm64](https://github.com/antoniolox1721/reach/releases/latest/download/reach-linux-arm64) |
+| Mac (Apple silicon) | [reach-macos-arm64](https://github.com/antoniolox1721/reach/releases/latest/download/reach-macos-arm64) |
+| Android phone | see [below](#using-your-phone-as-a-machine-android) |
 
-```
-npx github:antoniolox1721/reach
-```
+On Linux and Mac make it runnable first: `chmod +x reach-*`. The programs are not code-signed, so Windows SmartScreen shows "Windows protected your PC" the first time: choose *More info*, then *Run anyway*. On a Mac, right-click the file and choose *Open*.
 
-It creates your secret key, goes online, and prints:
+If you have Node.js 18+ and git you can skip the download and use `npx github:antoniolox1721/reach` wherever these instructions say to start reach.
 
-- a **dashboard link** (also as a QR code), and
-- a **join command** for your other machines.
+**2. First machine.** Start the program (double-click it on Windows). It says the machine is not on a dashboard yet. Press **Enter** to create your dashboard. It prints a **dashboard link** and a QR code. Open the link, or scan the QR code with your phone, and choose a **password** for that device. Your machine is in the list.
 
-Leave it running.
+**3. Every other machine.** Start the program. It shows a **code** like `ABCD-EFGH-JKLM`. In your dashboard choose **Add a machine**, type the code and confirm (or scan the QR code the new machine shows with the phone that already has your dashboard). The machine appears in the list a few seconds later. It does not matter which network each machine is on.
 
-**2. On every other machine**
+Leave the program running on a machine for as long as you want to reach it. It remembers its key in `~/.reach/config.json`, so next time you just start it.
 
-Paste the join command the first machine printed:
-
-```
-npx github:antoniolox1721/reach join <your key>
-```
-
-After the first time, plain `npx github:antoniolox1721/reach` is enough: the key is saved in `~/.reach/config.json`.
-
-**3. Open the dashboard**
-
-Scan the QR code with your phone, or open the dashboard link in any browser. The first time on each device it asks you to choose a **password**. From then on that device asks for the password every time the page is opened.
+**Adding machines without approving each one.** Run `reach keyfile` on a machine that is already set up. It writes a `reach.key` file. Any copy of the program started from a folder that contains that file joins by itself, with no code and no prompt. Carry the program and `reach.key` together on a USB stick, and treat that file like a master password.
 
 ## Using your phone as a machine (Android)
 
-To reach the phone's files from your PC, run reach on the phone inside [Termux](https://termux.dev) (install it from F-Droid):
+Opening the dashboard on a phone needs nothing but the browser. To also reach the phone's own files from your other machines, run reach on the phone inside [Termux](https://termux.dev) (install it from F-Droid):
 
 ```
 pkg install nodejs git
 termux-setup-storage
-npx github:antoniolox1721/reach join <your key>
+npx github:antoniolox1721/reach
 ```
 
-`termux-setup-storage` makes your photos, downloads and so on available under `~/storage/shared`; the dashboard shows it as a shortcut. Run `termux-wake-lock` so Android does not put it to sleep. Controlling other machines *from* the phone needs nothing installed, only the browser.
+It shows a pairing code like any other machine. `termux-setup-storage` makes your photos, downloads and so on available under `~/storage/shared`; the dashboard shows it as a shortcut. Run `termux-wake-lock` so Android does not put it to sleep.
 
-iPhones can use the dashboard but cannot run the agent.
+iPhones can use the dashboard but cannot run the program.
 
 ## The dashboard
 
-- **My machines**: every machine running reach with your key. Tap one to open it.
+- **My machines**: every machine running reach with your key. Tap one to open it. *Add a machine* takes the code a new machine shows.
 - **Files**: browse folders, tap a file to open (text and images), edit and save, download, rename or delete. *Upload* sends files from the device you are holding. *Open terminal here* is in a folder's `⋯` menu.
 - **Terminal**: type a command, see the output live. `cd` works. While a program runs you can type input for it or press *Stop*. Jobs keep running if you close the page or lose signal; tap a job under *Jobs* to pick its output back up.
 - **Scripts**: save commands you run often (name, command, folder) and start them with one tap. They are stored on the machine they belong to.
@@ -62,8 +54,10 @@ iPhones can use the dashboard but cannot run the agent.
 ## Commands
 
 ```
-reach                 put this machine online (creates your key on first run)
+reach                 put this machine online (first run: shows a pairing code for your dashboard)
+reach new             first machine: create a new key and dashboard
 reach join <key>      add this machine using the key (or dashboard link) from another one
+reach keyfile         write reach.key here; a copy of reach started next to that file joins by itself
 reach link            show the dashboard link, QR code and join command again
 reach ui [port]       serve the dashboard from this machine instead of the public page
 reach name <name>     rename this machine
@@ -75,7 +69,7 @@ reach rekey           replace the key (every other machine must join again)
 --no-qr               do not print the QR code
 ```
 
-With `npx`, write `npx github:antoniolox1721/reach` wherever it says `reach`. Or install it once with `npm install -g github:antoniolox1721/reach` and use `reach` directly.
+`reach` here means the downloaded program (for example `reach-windows-x64.exe link`), or `npx github:antoniolox1721/reach`, or plain `reach` after `npm install -g github:antoniolox1721/reach`.
 
 To keep a machine always reachable, start reach when the machine starts: Task Scheduler on Windows, a systemd user service or `@reboot` cron line on Linux, Termux:Boot on Android.
 
@@ -87,11 +81,13 @@ Anyone who controls reach can read your files and run commands, so this is the p
 - **The key is the access.** It is 256 random bits, created on your first machine and stored in `~/.reach/config.json`. Every message is encrypted and authenticated with AES-256-GCM using a key derived from it. A machine ignores anything that was not encrypted with your key. The relay channel name is also derived from the key.
 - **The link carries the key after the `#`.** That part of an address is never sent to a web server. The page removes it from the address bar immediately.
 - **The password protects the key on each device.** The browser stores the key only in encrypted form (PBKDF2-SHA256, 600,000 rounds, then AES-256-GCM). Without the password the stored data is useless. The password is per device and is never sent anywhere.
+- **Pairing codes are one-time and short-lived.** A new machine shows a random code (60 bits) that exists only while it waits. Your dashboard uses the code to encrypt your key for that one machine (the code is stretched with PBKDF2 first, so a recorded pairing cannot be cracked later). The dashboard asks you to confirm before it sends anything.
 - **Recorded messages cannot be replayed.** Each dashboard session gets a random session id from the machine and numbers its requests; a machine drops any request it has already seen.
 
 What you need to do:
 
-- Treat the key, the dashboard link and the join command like a master password. Do not paste them into chats or screenshots. The join command stays in your shell history.
+- Treat the key, the dashboard link, the join command and any `reach.key` file like a master password. Do not paste them into chats or screenshots.
+- Only approve a pairing code that you can see on a machine you started yourself. Never approve a code or open a pairing link that someone sends you: approving gives that machine your key.
 - If a device is lost or the key may have leaked, run `reach rekey` on one machine and `reach join <new key>` on the others. The old key stops working as soon as no machine uses it.
 - The public dashboard is served from `antoniolox1721.github.io`. Whoever controls that GitHub repository controls the page's code. If you would rather not depend on that, run `reach ui` and use the dashboard from `http://127.0.0.1:7700`, or fork the repository and pass `--dashboard` with your own address.
 
@@ -110,9 +106,12 @@ What the relay can still do: see that some device is online and how much data it
 git clone https://github.com/antoniolox1721/reach
 cd reach
 npm install
-npm test        # starts a real agent and drives it through the real relay
+npm test        # starts real agents and drives them through the real relay
 node reach.js ui
+node build.mjs  # standalone executable for this OS in dist/ (REACH_BIN=dist/... npm test checks it)
 ```
+
+Pushing a tag such as `v0.1.0` makes GitHub Actions build the executables for Windows, Linux and Mac and attach them to a release.
 
 Layout: `reach.js` is the agent and CLI. `docs/` is the dashboard (GitHub Pages serves it as is); `docs/core.js` holds the encryption and protocol and is shared by the agent and the page.
 

@@ -25,15 +25,32 @@ const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0'))
 export const randId = (n = 8) => hex(crypto.getRandomValues(new Uint8Array(n)));
 export const newKey = () => b64u.enc(crypto.getRandomValues(new Uint8Array(32)));
 
-// Accepts a bare key or a dashboard link containing #k=<key>[&b=<broker>].
+// A relay address ends up in links and in commands people copy, so only plain ws(s) URLs are accepted.
+export function checkBroker(broker) {
+  if (!broker) return '';
+  let ok = /^wss?:\/\/[A-Za-z0-9._~:@%/\[\]+-]+$/.test(broker);
+  try {
+    new URL(broker);
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new Error('The relay address must be a plain ws:// or wss:// URL.');
+  return broker;
+}
+
+// Accepts a bare key or a dashboard link containing #k=<key>[&b=<broker>]. Throws unless both are well formed.
 export function parseKeyInput(input) {
   const s = String(input || '').trim();
   const i = s.indexOf('#');
+  let key = s;
+  let broker = '';
   if (i >= 0 || s.includes('k=')) {
     const p = new URLSearchParams(i >= 0 ? s.slice(i + 1) : s);
-    return { key: p.get('k') || '', broker: p.get('b') || '' };
+    key = p.get('k') || '';
+    broker = p.get('b') || '';
   }
-  return { key: s, broker: '' };
+  if (!/^[A-Za-z0-9_-]{43}$/.test(key)) throw new Error('That is not a valid reach key.');
+  return { key, broker: checkBroker(broker) };
 }
 
 export async function deriveKeys(keyStr) {
@@ -89,6 +106,9 @@ export class Link {
     link.tx = Promise.resolve();
     link.rx = Promise.resolve();
     link.unacked = 0;
+    let ready;
+    // Resolves once the relay has confirmed the subscriptions, so replies cannot be missed.
+    link.ready = new Promise((r) => (ready = r));
     const opts = { clientId: 'reach_' + randId(8), clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 15000 };
     if (will) {
       const topic = link.topic(will.suffix);
@@ -96,7 +116,10 @@ export class Link {
     }
     const client = (link.client = mqttConnect(broker || DEFAULT_BROKER, opts));
     client.on('connect', () => {
-      client.subscribe(subscribe.map((s) => link.topic(s)), { qos: 1 }, () => onStatus?.('online'));
+      client.subscribe(subscribe.map((s) => link.topic(s)), { qos: 1 }, () => {
+        ready();
+        onStatus?.('online');
+      });
     });
     client.on('close', () => onStatus?.('offline'));
     client.on('error', () => {});
@@ -152,6 +175,78 @@ export class Link {
 }
 
 const err = (message, code) => Object.assign(new Error(message), { code });
+
+// ---------- pairing: hand the key to a new machine using a one-time code shown on its screen ----------
+
+const PAIR_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+export function newPairCode() {
+  const c = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => PAIR_ALPHABET[b & 31]).join('');
+  return c.slice(0, 4) + '-' + c.slice(4, 8) + '-' + c.slice(8);
+}
+
+export function normalizePairCode(input) {
+  const c = String(input || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+  if (!/^[2-9A-HJ-NP-Z]{12}$/.test(c)) throw new Error('That is not a valid pairing code. It looks like XXXX-XXXX-XXXX.');
+  return c.slice(0, 4) + '-' + c.slice(4, 8) + '-' + c.slice(8);
+}
+
+// The code (60 random bits) is stretched so that a recorded pairing cannot be brute-forced later.
+async function pairKeys(code) {
+  const base = await crypto.subtle.importKey('raw', te.encode(normalizePairCode(code)), 'PBKDF2', false, ['deriveBits']);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('reach/pair/v1'), iterations: 300000 }, base, 384));
+  const enc = await crypto.subtle.importKey('raw', bits.subarray(16), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return { enc, base: 'reach1p/' + hex(bits.subarray(0, 16)) };
+}
+
+// New machine: waits until a dashboard that knows the code sends the key. Returns { promise, cancel }.
+export function pairWait({ mqttConnect, broker, code, name }) {
+  let link;
+  let cancelled = false;
+  const promise = (async () => {
+    const keys = await pairKeys(code);
+    link = await Link.open({ mqttConnect, broker, keys, subscribe: ['offer'] });
+    if (cancelled) link.close();
+    const offer = await new Promise((resolve) => {
+      link.on('offer', (h) => {
+        try {
+          resolve(parseKeyInput('#' + new URLSearchParams({ k: h.key, ...(h.broker ? { b: h.broker } : {}) })));
+        } catch {}
+      });
+    });
+    await link.send('ack', { y: 'ack', name }).catch(() => {});
+    link.close();
+    return offer;
+  })();
+  return {
+    promise,
+    cancel() {
+      cancelled = true;
+      link?.close();
+    },
+  };
+}
+
+// Dashboard: sends the key to the machine showing this code. Resolves with the machine's name.
+export async function pairOffer({ mqttConnect, broker, code, secret, timeout = 45000 }) {
+  const keys = await pairKeys(code);
+  const link = await Link.open({ mqttConnect, broker, keys, subscribe: ['ack'] });
+  let timer;
+  let retry;
+  try {
+    return await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(err('No machine answered for that code. Check the code and that the machine is still waiting.', 'TIMEOUT')), timeout);
+      link.on('ack', (h) => resolve(String(h.name || 'machine')));
+      const offer = () => link.ready.then(() => link.send('offer', { y: 'offer', key: secret.key, broker: secret.broker || '' })).catch(() => {});
+      retry = setInterval(offer, 2500);
+      offer();
+    });
+  } finally {
+    clearTimeout(timer);
+    clearInterval(retry);
+    link.close();
+  }
+}
 
 // Talks to agents: discovery, request/response, file transfer, job output.
 export class Controller {
