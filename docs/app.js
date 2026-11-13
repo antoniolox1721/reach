@@ -701,6 +701,13 @@ const crc32 = (crc, bytes) => {
   return crc;
 };
 
+// A name as it may appear inside a zip: never a path of its own. Names come from the remote machine, and a
+// Mac or Linux file may legally be called "..\\..\\x", which Windows would unpack outside the folder.
+const zipName = (name) => {
+  const clean = String(name).replace(/[\\/:\u0000-\u001f]/g, '_');
+  return clean === '.' || clean === '..' || !clean ? '_' + clean : clean;
+};
+
 // Lists everything under a folder. Returns files and (so that empty ones survive) folders, with zip-style paths.
 async function walkFolder(agent, root, rootName, signal) {
   const sep = current.info.sep;
@@ -709,7 +716,7 @@ async function walkFolder(agent, root, rootName, signal) {
   const dirs = [];
   const unreadable = [];
   let bytes = 0;
-  const todo = [{ path: root, rel: rootName + '/', depth: 0 }];
+  const todo = [{ path: root, rel: zipName(rootName) + '/', depth: 0 }];
   while (todo.length) {
     if (signal.aborted) throw new Error('Cancelled.');
     const dir = todo.pop();
@@ -724,9 +731,9 @@ async function walkFolder(agent, root, rootName, signal) {
     if (listing.truncated) throw new Error(`"${dir.rel}" holds more than 5000 entries, which is too many to download this way.`);
     for (const e of listing.entries) {
       if (e.d) {
-        if (dir.depth < 40) todo.push({ path: join(listing.path, e.n), rel: dir.rel + e.n + '/', depth: dir.depth + 1 });
+        if (dir.depth < 40) todo.push({ path: join(listing.path, e.n), rel: dir.rel + zipName(e.n) + '/', depth: dir.depth + 1 });
       } else {
-        files.push({ path: join(listing.path, e.n), rel: dir.rel + e.n, size: e.s, mtime: e.m });
+        files.push({ path: join(listing.path, e.n), rel: dir.rel + zipName(e.n), size: e.s, mtime: e.m });
         bytes += e.s;
       }
     }
