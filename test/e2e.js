@@ -23,7 +23,8 @@ const BIN = process.env.REACH_BIN && path.resolve(process.env.REACH_BIN);
 const PORT = 7790 + Math.floor(Math.random() * 100);
 const children = [];
 const reach = (args, home, opts = {}) => {
-  const env = { ...process.env, REACH_HOME: path.join(tmp, home) };
+  // A real background client may be running on this computer; keep the test's programs from deferring to it.
+  const env = { ...process.env, REACH_HOME: path.join(tmp, home), REACH_SERVICE_PORT: String(PORT + 9) };
   const child = BIN ? spawn(BIN, args, { env, ...opts }) : spawn(process.execPath, [path.join(root, 'reach.js'), ...args], { env, ...opts });
   children.push(child);
   return child;
@@ -242,6 +243,25 @@ if (BIN)
       await sh(installed, ['stop', '--port', String(sport)]).catch(() => {});
       if (win) spawnSync('reg', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'reach-selftest', '/f']);
       else fs.rmSync(path.join(os.homedir(), '.config/autostart/reach-selftest.desktop'), { force: true });
+    }
+  });
+
+if (BIN)
+  step('join: one command puts a machine on the dashboard in the background (the Mac route)', async () => {
+    const sport = PORT + 3;
+    const env = { ...process.env, REACH_HOME: path.join(tmp, 'home8'), REACH_RUN_NAME: 'reach-selftest', REACH_NO_TRAY: '1' };
+    const sh = (file, args) => new Promise((r) => spawn(file, args, { env, stdio: 'ignore' }).on('close', r));
+    const installed = path.join(tmp, 'home8', 'bin', win ? 'reach.exe' : 'reach');
+    try {
+      assert.equal(await sh(BIN, ['join', pub, '--name', 'joined box', '--port', String(sport)]), 0);
+      await until(() => online('joined box'), 'joined machine online');
+      const box = online('joined box').id;
+      const { r } = await ctl.call(box, 'exec', { cmd: 'echo from-joined', cwd: work });
+      assert.match((await collect(r.job, box)).text, /from-joined/);
+      assert.notEqual(await sh(BIN, ['join', 'not-an-address', '--port', String(sport)]), 0, 'a bad address is refused');
+    } finally {
+      await sh(installed, ['stop', '--port', String(sport)]);
+      await sh(installed, ['autostart', 'off', '--port', String(sport)]);
     }
   });
 

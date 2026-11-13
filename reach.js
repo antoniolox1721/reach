@@ -75,6 +75,8 @@ client programs. A client program only puts its machine on your dashboard.
   reach                 dashboard program: open the dashboard (stays in this window)
                         client program: put this machine on the dashboard, in the background,
                         now and every time the computer starts
+  reach join <address>  put this machine on the dashboard with that address, in the background and
+                        at every startup (the dashboard shows the full command to paste)
   reach stop            stop the background client
   reach autostart on|off   whether the client starts with the computer
   reach kit [folder]    prepare everything: a new dashboard for this computer (you only choose the
@@ -706,6 +708,7 @@ function install() {
 }
 
 const autostartFile = path.join(os.homedir(), '.config', 'autostart', RUN_NAME + '.desktop');
+const launchAgent = path.join(os.homedir(), 'Library', 'LaunchAgents', `com.${RUN_NAME}.client.plist`);
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
 function setAutostart(on, port) {
@@ -713,6 +716,13 @@ function setAutostart(on, port) {
   if (process.platform === 'win32') {
     const r = on ? spawnSync('reg', ['add', RUN_KEY, '/v', RUN_NAME, '/t', 'REG_SZ', '/d', `"${INSTALLED}" ${args}`, '/f'], { windowsHide: true }) : spawnSync('reg', ['delete', RUN_KEY, '/v', RUN_NAME, '/f'], { windowsHide: true });
     return r.status === 0;
+  }
+  if (process.platform === 'darwin') {
+    if (!on) return fs.rmSync(launchAgent, { force: true }), true;
+    const xml = (v) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    fs.mkdirSync(path.dirname(launchAgent), { recursive: true });
+    fs.writeFileSync(launchAgent, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.${xml(RUN_NAME)}.client</string>\n<key>ProgramArguments</key><array>${[INSTALLED, ...args.split(' ')].map((a) => `<string>${xml(a)}</string>`).join('')}</array>\n<key>RunAtLoad</key><true/>\n</dict></plist>\n`);
+    return true;
   }
   if (process.platform !== 'linux') return false;
   if (!on) return fs.rmSync(autostartFile, { force: true }), true;
@@ -723,7 +733,7 @@ function setAutostart(on, port) {
 
 function hasAutostart() {
   if (process.platform === 'win32') return spawnSync('reg', ['query', RUN_KEY, '/v', RUN_NAME], { windowsHide: true }).status === 0;
-  return fs.existsSync(autostartFile);
+  return fs.existsSync(process.platform === 'darwin' ? launchAgent : autostartFile);
 }
 
 // Windows notification-area icon, drawn and run by a hidden PowerShell helper. It prints the menu item that
@@ -797,7 +807,7 @@ async function main() {
   const { flags, rest } = parseArgs(process.argv.slice(2));
   const cmd = rest[0] || 'up';
   if (flags.help || cmd === 'help') return console.log(HELP);
-  if (!['up', 'pair', 'client', 'name', 'kit', 'stop', 'autostart'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
+  if (!['up', 'pair', 'client', 'name', 'kit', 'stop', 'autostart', 'join'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
   const cfg = loadConfig();
   if (flags.name) cfg.name = flags.name;
   if (flags.broker !== undefined) cfg.broker = checkBroker(flags.broker);
@@ -814,10 +824,16 @@ async function main() {
     cfg.dpub = stamp.pub;
     cfg.broker = stamp.broker;
   }
+  if (cmd === 'join') {
+    if (stamp) throw new Error('This client program already belongs to a dashboard. Just run it.');
+    cfg.dpub = checkPublic(rest[1]);
+    cfg.disabled = false;
+  }
   if (cfg.dpub) checkPublic(cfg.dpub);
   saveConfig(cfg);
   // The dashboard page uses 7700. The background client answers "are you running?" and "stop" on 7701.
-  const servicePort = stamp || cmd !== 'up' ? Number(flags.port) || 7701 : 7701;
+  const SERVICE_DEFAULT = Number(process.env.REACH_SERVICE_PORT) || 7701;
+  const servicePort = stamp || cmd !== 'up' || flags.background ? Number(flags.port) || SERVICE_DEFAULT : SERVICE_DEFAULT;
   const port = Number(flags.port) || 7700;
   if (cmd === 'name') return console.log(`This machine is now called "${cfg.name}".`);
   if (cmd === 'kit') {
@@ -830,7 +846,8 @@ async function main() {
     cfg.autostart = rest[1] === 'on';
     saveConfig(cfg);
     if (cfg.autostart) {
-      if (!stamp) throw new Error('Only client programs start with the computer. Run the client program from your dashboard on this machine.');
+      if (!cfg.dpub) throw new Error('This machine is not on a dashboard yet.');
+      if (!PACKED) throw new Error('Starting with the computer needs the downloaded program, not the source.');
       install();
     }
     if (!setAutostart(cfg.autostart, servicePort)) throw new Error('Starting with the computer is not supported on this system.');
@@ -838,7 +855,7 @@ async function main() {
   }
 
   // A client program hands over to an installed copy of itself that runs in the background and at startup.
-  if (cmd === 'up' && stamp && !flags.foreground && !flags.background) {
+  if (((cmd === 'up' && stamp) || (cmd === 'join' && PACKED)) && !flags.foreground && !flags.background) {
     await stopService(servicePort);
     install();
     if (cfg.autostart !== false) setAutostart(true, servicePort);
@@ -846,19 +863,19 @@ async function main() {
     for (let i = 0; i < 60 && !(await local(servicePort, 'ping'))?.reach; i++) await sleep(250);
     if (!(await local(servicePort, 'ping'))?.reach) throw new Error('reach did not start in the background. Try again with --foreground to see why.');
     console.log(`"${cfg.name}" is on your dashboard. reach keeps running in the background and starts with the computer.`);
-    if (process.platform !== 'win32') console.log(`Stop it with:           "${INSTALLED}" stop\nNo longer at startup:   "${INSTALLED}" autostart off`);
+    if (process.platform !== 'win32') console.log(`\nStop it with:           "${INSTALLED}" stop\nNo longer at startup:   "${INSTALLED}" autostart off`);
     return;
   }
 
-  const background = !!flags.background && !!stamp;
+  const background = !!flags.background;
   // If the background client already runs on this computer, the dashboard program must not start a second one.
-  const serviceRunning = !background && !!(await local(7701, 'ping'))?.reach;
+  const serviceRunning = cmd === 'up' && !stamp && !background && !!(await local(SERVICE_DEFAULT, 'ping'))?.reach;
   const url = `http://127.0.0.1:${port}/`;
   let tray = null;
   const state = {
     client: null,
     pairCode: '',
-    clientOnly: !!stamp,
+    clientOnly: !!stamp || background,
     serviceRunning,
     claimToken: randId(16),
     openDashboard() {
@@ -897,7 +914,7 @@ async function main() {
       toggle: cfg.disabled ? 'Enable' : 'Disable',
       canToggle: !!cfg.dpub,
       auto: hasAutostart(),
-      open: !stamp,
+      open: false,
       ...(balloon ? { balloon } : {}),
     });
   process.on('SIGINT', state.quit);
@@ -930,7 +947,7 @@ async function main() {
   }
 
   // A stamped program is a client and nothing else: it never opens a dashboard.
-  if (stamp || cmd === 'client') {
+  if (stamp || cmd === 'client' || cmd === 'join') {
     if (!cfg.dpub) throw new Error('This machine is not on a dashboard yet. Run "reach pair", or use a client program downloaded from your dashboard.');
     return console.log(`reach ${PKG.version}: "${cfg.name}" is on your dashboard while this stays open. Ctrl+C stops it.`);
   }

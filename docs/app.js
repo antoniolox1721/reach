@@ -389,8 +389,19 @@ function showMachines() {
           h('div', { class: 'row wrap' }, local.targets.map((t) => h('a', { class: 'button', href: '/api/client?target=' + t + '&' + query, download: '' }, 'Client for ' + (names[t] || t))))
         )
       : h('p', { class: 'small' }, 'Client programs are made by the dashboard program on a computer: ', h('a', { href: 'https://github.com/antoniolox1721/reach/releases/latest', target: '_blank', rel: 'noopener noreferrer' }, 'get it here'), ', open your dashboard there and choose "Add a machine".'),
+    h('h3', null, 'A Mac, or Linux without a desktop'),
+    h('p', { class: 'small' }, 'Open Terminal on that machine, paste the line for it and press Enter. It appears here by itself and comes back whenever the machine starts.'),
+    ['macos-arm64', 'linux-x64', 'linux-arm64'].map((t) => {
+      const cmd = `curl -fsSL https://github.com/antoniolox1721/reach/releases/latest/download/reach-dashboard-${t} -o reach-setup && chmod +x reach-setup && ./reach-setup join ${ctl.pub}${secret.broker ? ' --broker ' + secret.broker : ''}; rm -f reach-setup`;
+      return h(
+        'div',
+        { class: 'cmdrow' },
+        h('div', { class: 'small dim' }, { 'macos-arm64': 'Mac (Apple silicon: M1 or newer)', 'linux-x64': 'Linux', 'linux-arm64': 'Linux (ARM, e.g. Raspberry Pi)' }[t]),
+        h('div', { class: 'row' }, h('div', { class: 'cmdbox mono grow' }, cmd), h('button', { type: 'button', onclick: () => navigator.clipboard.writeText(cmd).then(() => toast('Copied. Paste it in Terminal on that machine.'), () => toast('Select the text and copy it by hand.', true)) }, 'Copy'))
+      );
+    }),
     h('h3', null, 'With a code'),
-    h('p', { class: 'small' }, 'For a Mac, a phone, or a machine that is showing a pairing code: type the code here.'),
+    h('p', { class: 'small' }, 'For a phone, or a machine that is showing a pairing code: type the code here.'),
     h(
       'form',
       {

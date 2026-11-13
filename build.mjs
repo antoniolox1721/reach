@@ -17,6 +17,31 @@ if (process.argv.includes('--smoke')) {
   const help = execFileSync(path.resolve(out), ['--help'], { encoding: 'utf8' });
   if (!help.includes(`reach ${pkg.version}`)) throw new Error('unexpected --help output:\n' + help);
   console.log(`${out} runs: ${help.split('\n')[0]}`);
+
+  // Join a throwaway dashboard address, then check the background client, its startup entry and stopping it.
+  const { webcrypto } = await import('node:crypto');
+  const pair = await webcrypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const address = Buffer.from(await webcrypto.subtle.exportKey('raw', pair.publicKey)).toString('base64url');
+  const home = fs.mkdtempSync(path.join((await import('node:os')).tmpdir(), 'reach-smoke-'));
+  const env = { ...process.env, REACH_HOME: home, REACH_RUN_NAME: 'reach-smoke', REACH_NO_TRAY: '1' };
+  const installed = path.join(home, 'bin', process.platform === 'win32' ? 'reach.exe' : 'reach');
+  const run = (file, args) => execFileSync(file, args, { env, encoding: 'utf8' });
+  const ping = () => fetch('http://127.0.0.1:7788/api/ping').then((r) => r.json(), () => null);
+  try {
+    console.log(run(path.resolve(out), ['join', address, '--port', '7788']).trim().split('\n')[0]);
+    if (!(await ping())?.clientOnly) throw new Error('the background client is not running');
+    console.log('background client running from', installed);
+    console.log(run(installed, ['autostart', 'off', '--port', '7788']).trim());
+    console.log(run(installed, ['autostart', 'on', '--port', '7788']).trim());
+    console.log(run(installed, ['autostart', 'off', '--port', '7788']).trim());
+    console.log(run(installed, ['stop', '--port', '7788']).trim());
+    if (await ping()) throw new Error('the background client did not stop');
+  } finally {
+    try { run(installed, ['stop', '--port', '7788']); } catch {}
+    try { run(installed, ['autostart', 'off', '--port', '7788']); } catch {}
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+  }
+  console.log('join, background, startup entry and stop all work on ' + process.platform);
   process.exit(0);
 }
 

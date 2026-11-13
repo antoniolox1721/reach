@@ -59,21 +59,34 @@ Running a client program does three things and then returns at once:
 
 The dashboard program is different on purpose: it is an ordinary window that you open when you want your dashboard and close when you are done.
 
-### Macs, Android phones and other machines
+### Macs, and Linux machines without a desktop
 
-Client programs cannot be made for Macs (stamping breaks their signature) or phones. Those join with a one-time code instead:
+Under **Add a machine** the dashboard shows a line to paste into Terminal on that machine, for example:
 
-- **Mac**: start the dashboard program, and on the page choose *Only add this computer to a dashboard I have elsewhere*. It shows a code. On your dashboard choose *Add a machine* and type the code.
-- **Android** (to reach the phone's own files): install [Termux](https://termux.dev) from F-Droid, then:
+```
+curl -fsSL https://github.com/antoniolox1721/reach/releases/latest/download/reach-dashboard-macos-arm64 -o reach-setup && chmod +x reach-setup && ./reach-setup join <your dashboard's address>; rm -f reach-setup
+```
 
-  ```
-  pkg install nodejs git
-  termux-setup-storage
-  npx github:antoniolox1721/reach pair
-  ```
+Paste it, press Enter, and the machine appears on your dashboard. Like a client program it installs itself to `~/.reach/bin`, runs in the background and starts again at login (a LaunchAgent on a Mac). The address in the line is your dashboard's public address, not a secret. Stop it with `~/.reach/bin/reach stop`; keep it from starting at login with `~/.reach/bin/reach autostart off`.
 
-  Type the code it shows into your dashboard. `termux-setup-storage` makes photos and downloads available under `~/storage/shared`. Run `termux-wake-lock` so Android does not put it to sleep.
-- **Any machine with Node.js 18+ and git**: `npx github:antoniolox1721/reach pair`.
+**The program is not signed by Apple. Why this still opens:** macOS only blocks unsigned programs that were downloaded by a browser, which marks them as quarantined. `curl` does not mark them, so the line above runs without any warning. If you downloaded the program with a browser instead, macOS says it "cannot be opened because the developer cannot be verified". Then either:
+
+- run `xattr -d com.apple.quarantine ~/Downloads/reach-dashboard-macos-arm64` in Terminal, followed by `chmod +x ~/Downloads/reach-dashboard-macos-arm64`, or
+- try to open it once, then go to System Settings → Privacy & Security, scroll down and click **Open Anyway**.
+
+The Mac build is for Apple silicon (M1 or newer). On an Intel Mac, install Node.js and use `npx github:antoniolox1721/reach join <your dashboard's address>`; that one runs only while its Terminal window stays open.
+
+### Android phones
+
+To reach the phone's own files, install [Termux](https://termux.dev) from F-Droid, then:
+
+```
+pkg install nodejs git
+termux-setup-storage
+npx github:antoniolox1721/reach pair
+```
+
+Type the code it shows into your dashboard under *Add a machine*. `termux-setup-storage` makes photos and downloads available under `~/storage/shared`. Run `termux-wake-lock` so Android does not put it to sleep. It is reachable while Termux keeps running.
 
 iPhones can use the dashboard but cannot be a machine on it.
 
@@ -93,6 +106,8 @@ Double-clicking is enough. From a terminal:
 reach                 dashboard program: open the dashboard (stays in this window)
                       client program: put this machine on the dashboard, in the background,
                       now and every time the computer starts
+reach join <address>  put this machine on the dashboard with that address, in the background and
+                      at every startup (the dashboard shows the full line to paste)
 reach stop            stop the background client
 reach autostart on|off   whether the client starts with the computer
 reach kit [folder]    prepare a new dashboard for this computer plus Windows and Linux client programs
@@ -110,7 +125,7 @@ reach name <name>     rename this machine
 
 `reach` here means the downloaded program, or `npx github:antoniolox1721/reach`.
 
-Machines added with a pairing code (`reach pair`, Macs, Termux) are reachable only while that program stays open; client programs handle this by themselves.
+Machines added with a pairing code (`reach pair`, Termux) are reachable only while that program stays open; client programs and `reach join` handle this by themselves.
 
 ## Security
 
