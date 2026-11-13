@@ -93,7 +93,7 @@ iPhones can use the dashboard but cannot be a machine on it.
 ## The dashboard
 
 - **My machines**: every machine that is online. Tap one to open it.
-- **Files**: browse folders, tap a file to open (text and images), edit and save, download, rename or delete. *Upload* sends files from the device you are holding. *Open terminal here* is in a folder's `⋯` menu.
+- **Files**: browse folders, tap a file to open (text and images), edit and save, download, rename or delete. *Upload* sends files from the device you are holding. A folder's `⋯` menu has *Download as zip* (the whole folder with everything inside, up to 2 GB) and *Open terminal here*.
 - **Terminal**: type a command, see the output live. `cd` works. While a program runs you can type input for it or press *Stop*. Jobs keep running if you close the page or lose signal; tap a job under *Jobs* to pick its output back up.
 - **Scripts**: save commands you run often (name, command, folder) and start them with one tap. They are stored on the machine they belong to.
 - **Lock**: closes the dashboard until the password is typed again.

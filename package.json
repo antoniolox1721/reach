@@ -1,6 +1,6 @@
 {
   "name": "reach",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A password-protected dashboard for your machines: files, commands and saved scripts. Client programs only add a machine; end-to-end encrypted, no VPN or port forwarding.",
   "type": "module",
   "bin": {

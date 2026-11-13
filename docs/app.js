@@ -615,6 +615,7 @@ function fileSheet(e, dir, go) {
   sheet(e.n, [
     !e.d && ['Open', () => openFile(e, full, refresh)],
     !e.d && ['Download to this device', () => downloadFile(e, full)],
+    e.d && ['Download as zip', () => downloadFolder(e, full)],
     e.d && [
       'Open terminal here',
       () => {
@@ -680,6 +681,149 @@ async function downloadFile(e, full) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// ---------- whole folders, as a zip built here in the browser ----------
+
+const MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_ZIP_FILES = 20000;
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+const crc32 = (crc, bytes) => {
+  for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return crc;
+};
+
+// Lists everything under a folder. Returns files and (so that empty ones survive) folders, with zip-style paths.
+async function walkFolder(agent, root, rootName, signal) {
+  const sep = current.info.sep;
+  const join = (dir, name) => (dir.endsWith(sep) ? dir : dir + sep) + name;
+  const files = [];
+  const dirs = [];
+  const unreadable = [];
+  let bytes = 0;
+  const todo = [{ path: root, rel: rootName + '/', depth: 0 }];
+  while (todo.length) {
+    if (signal.aborted) throw new Error('Cancelled.');
+    const dir = todo.pop();
+    dirs.push(dir.rel);
+    let listing;
+    try {
+      listing = (await ctl.call(agent, 'ls', { path: dir.path })).r;
+    } catch {
+      unreadable.push(dir.rel);
+      continue;
+    }
+    if (listing.truncated) throw new Error(`"${dir.rel}" holds more than 5000 entries, which is too many to download this way.`);
+    for (const e of listing.entries) {
+      if (e.d) {
+        if (dir.depth < 40) todo.push({ path: join(listing.path, e.n), rel: dir.rel + e.n + '/', depth: dir.depth + 1 });
+      } else {
+        files.push({ path: join(listing.path, e.n), rel: dir.rel + e.n, size: e.s, mtime: e.m });
+        bytes += e.s;
+      }
+    }
+    if (files.length > MAX_ZIP_FILES) throw new Error(`That folder holds more than ${MAX_ZIP_FILES} files, which is too many to download this way.`);
+    if (bytes > MAX_ZIP_BYTES) throw new Error('That folder is larger than 2 GB, which is too much to download through the browser.');
+  }
+  return { files, dirs, unreadable, bytes };
+}
+
+async function downloadFolder(e, full) {
+  const agent = current.id;
+  const t = transfer('↓ ' + e.n + '.zip');
+  try {
+    const tree = await walkFolder(agent, full, e.n, t.signal);
+    const enc = new TextEncoder();
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    let done = 0;
+    // One zip entry, stored without compression. Writes the local header and remembers the central-directory record.
+    const add = (name, data, crc, size, mtime) => {
+      const nameBytes = enc.encode(name);
+      const d = new Date(mtime || Date.now());
+      const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+      const date = ((Math.max(1980, d.getFullYear()) - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+      const head = new DataView(new ArrayBuffer(30));
+      head.setUint32(0, 0x04034b50, true);
+      head.setUint16(4, 20, true);
+      head.setUint16(6, 0x0800, true);
+      head.setUint16(10, time, true);
+      head.setUint16(12, date, true);
+      head.setUint32(14, crc, true);
+      head.setUint32(18, size, true);
+      head.setUint32(22, size, true);
+      head.setUint16(26, nameBytes.length, true);
+      const cen = new DataView(new ArrayBuffer(46));
+      cen.setUint32(0, 0x02014b50, true);
+      cen.setUint16(4, 20, true);
+      cen.setUint16(6, 20, true);
+      cen.setUint16(8, 0x0800, true);
+      cen.setUint16(12, time, true);
+      cen.setUint16(14, date, true);
+      cen.setUint32(16, crc, true);
+      cen.setUint32(20, size, true);
+      cen.setUint32(24, size, true);
+      cen.setUint16(28, nameBytes.length, true);
+      cen.setUint32(38, name.endsWith('/') ? 0x10 : 0, true);
+      cen.setUint32(42, offset, true);
+      central.push(cen.buffer, nameBytes);
+      parts.push(head.buffer, nameBytes, ...data);
+      offset += 30 + nameBytes.length + size;
+    };
+    for (const dir of tree.dirs) add(dir, [], 0, 0, 0);
+    for (const f of tree.files) {
+      const chunks = [];
+      let crc = 0xffffffff;
+      let size = 0;
+      const before = done;
+      try {
+        await ctl.download(agent, f.path, {
+          signal: t.signal,
+          onChunk: (c) => {
+            chunks.push(c.slice());
+            crc = crc32(crc, c);
+            size += c.length;
+            done = before + size;
+            t.progress(done, Math.max(tree.bytes, done));
+          },
+        });
+      } catch (err) {
+        if (err.code === 'ABORT') throw err;
+        tree.unreadable.push(f.rel);
+        done = before;
+        continue;
+      }
+      if (offset + size > MAX_ZIP_BYTES) throw new Error('That folder grew past 2 GB while downloading.');
+      add(f.rel, chunks, (crc ^ 0xffffffff) >>> 0, size, f.mtime);
+    }
+    const count = central.length / 2;
+    const centralSize = central.reduce((n, b) => n + b.byteLength, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, count, true);
+    end.setUint16(10, count, true);
+    end.setUint32(12, centralSize, true);
+    end.setUint32(16, offset, true);
+    const url = URL.createObjectURL(new Blob([...parts, ...central, end.buffer], { type: 'application/zip' }));
+    const a = h('a', { href: url, download: e.n + '.zip' });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    if (tree.unreadable.length) toast(`Downloaded, but ${tree.unreadable.length} item(s) could not be read and were left out, e.g. ${tree.unreadable[0]}`, true);
+    else toast(`Downloaded ${e.n}.zip (${tree.files.length} files).`);
+  } finally {
+    t.end();
+  }
 }
 
 async function openFile(e, full, refresh) {
