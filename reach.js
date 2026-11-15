@@ -9,7 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 import qrcode from 'qrcode-terminal';
-import { Link, seal, unseal, channelKey, fleetBase, agentIdOf, newSecret, publicOf, checkPublic, checkBroker, newPairCode, pairWait, randId, b64u, CHUNK, DEFAULT_BROKER } from './docs/core.js';
+import { Link, seal, unseal, channelKey, fleetBase, agentIdOf, newSecret, publicOf, checkPublic, checkBroker, newPairCode, pairWait, randId, b64u, newer, CHUNK, DEFAULT_BROKER } from './docs/core.js';
 
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
 
@@ -27,7 +27,9 @@ const CONFIG = path.join(HOME_DIR, 'config.json');
 // Where the program installs the copy of itself that runs in the background and at startup.
 const INSTALLED = path.join(HOME_DIR, 'bin', process.platform === 'win32' ? 'reach.exe' : 'reach');
 const RUN_NAME = process.env.REACH_RUN_NAME || 'reach';
-const RELEASES = 'https://github.com/antoniolox1721/reach/releases/latest/download/';
+const REPO = process.env.REACH_RELEASES || 'https://github.com/antoniolox1721/reach/releases';
+const RELEASES = REPO + '/latest/download/';
+const UPDATE_EVERY = Number(process.env.REACH_UPDATE_EVERY) || 6 * 60 * 60 * 1000;
 const TARGETS = ['windows-x64', 'linux-x64', 'linux-arm64'];
 const RING = 1024 * 1024;
 const MAX_JOBS = 30;
@@ -60,6 +62,7 @@ function parseArgs(argv) {
     else if (a === '--no-open') flags.noOpen = true;
     else if (a === '--foreground') flags.foreground = true;
     else if (a === '--background') flags.background = true;
+    else if (a === '--fresh') flags.fresh = true;
     else if (a === '--name' || a === '--broker' || a === '--port' || a === '--targets') flags[a.slice(2)] = argv[++i];
     else if (a === '-h' || a === '--help') flags.help = true;
     else rest.push(a);
@@ -79,6 +82,9 @@ client programs. A client program only puts its machine on your dashboard.
                         at every startup (the dashboard shows the full command to paste)
   reach stop            stop the background client
   reach autostart on|off   whether the client starts with the computer
+  reach autoupdate on|off  whether the background client installs new versions by itself (default on)
+  reach clients [folder]   make client programs again for the dashboard this computer is on (for example
+                        after a new version); no new dashboard is made, so nothing you added is lost
   reach kit [folder]    prepare everything: a new dashboard for this computer (you only choose the
                         password) and client programs for Windows and Linux in the folder
   reach pair            show a one-time code to add this machine to a dashboard, then stay online
@@ -127,6 +133,29 @@ function userName() {
   }
 }
 
+// macOS asks on the machine's own screen before a program may open Desktop, Documents, Downloads and
+// similar folders, unless the program was given Full Disk Access. Looking at this folder never asks: it
+// is simply refused without that access.
+function fullDiskAccess() {
+  if (process.platform !== 'darwin') return true;
+  try {
+    fs.readdirSync(path.join(os.homedir(), 'Library', 'Application Support', 'com.apple.TCC'));
+    return true;
+  } catch (e) {
+    return e.code === 'ENOENT';
+  }
+}
+
+// Whether commands can be given a real terminal on this machine (Linux, through the "script" tool).
+let ptyTool;
+const hasPty = () => (ptyTool ??= process.platform === 'linux' && spawnSync('script', ['--version'], { stdio: 'ignore' }).status === 0);
+// Inside a terminal, programs such as git would otherwise wait in a pager for keys nobody can press.
+const PTY_ENV = { TERM: 'dumb', PAGER: 'cat', GIT_PAGER: 'cat', SYSTEMD_PAGER: '' };
+// A terminal made this way starts with no size, which makes shells cut their lines short.
+const PTY_SIZE = 'stty cols 200 rows 50 2>/dev/null';
+// "wsl" on its own (optionally with a distribution, user or folder), which opens a Linux shell.
+const BARE_WSL = /^\s*wsl(?:\.exe)?((?:\s+(?:~|(?:--cd|-d|--distribution|-u|--user)\s+[^\s&|<>^"]+))*)\s*$/i;
+
 // ---------- client: makes this machine reachable from the dashboard it belongs to ----------
 
 class Reply {
@@ -164,19 +193,28 @@ async function startClient(cfg) {
     cpus: os.cpus().length,
     mem: os.totalmem(),
     version: PKG.version,
+    ...(process.platform === 'darwin' ? { fda: fullDiskAccess() } : {}),
   });
 
   // Presence carries our public key in the clear so the dashboard can derive the shared key.
-  const hello = async (y) => {
-    const sealed = await seal(key, T.hello, { y, name: cfg.name, os: osLabel(), host: os.hostname(), boot, ts: Date.now() });
+  // c: which of the link's two connections this is said on, so that a goodbye from the other one is not believed.
+  const hello = async (y, c = link.index) => {
+    const sealed = await seal(key, T.hello, { y, c, name: cfg.name, os: osLabel(), host: os.hostname(), boot, ts: Date.now() });
     const out = new Uint8Array(65 + sealed.length);
     out.set(pubRaw);
     out.set(sealed, 65);
     return out;
   };
   let lastAnnounce = 0;
+  let later = null;
   const announce = (force) => {
-    if (!force && Date.now() - lastAnnounce < 1000) return;
+    // Asked again right after announcing: answer a moment later rather than not at all, since the dashboard
+    // that asks now was not listening yet.
+    const wait = lastAnnounce + 1000 - Date.now();
+    if (!force && wait > 0) {
+      later ??= setTimeout(() => ((later = null), announce(true)), wait).unref();
+      return;
+    }
     lastAnnounce = Date.now();
     link.publish(T.hello, () => hello('pres'), 0).catch(() => {});
   };
@@ -185,7 +223,7 @@ async function startClient(cfg) {
     mqttConnect: mqtt.connect,
     broker: cfg.broker,
     subscribe: [T.who, T.to],
-    will: { topic: T.hello, payload: Buffer.from(await hello('bye')) },
+    wills: await Promise.all([0, 1].map(async (c) => ({ topic: T.hello, payload: Buffer.from(await hello('bye', c)) }))),
     onStatus: (s) => {
       console.log(new Date().toLocaleTimeString() + (s === 'online' ? '  connected' : '  disconnected, retrying...'));
       if (s === 'online') announce(true);
@@ -347,10 +385,11 @@ async function startClient(cfg) {
       if (typeof cmd !== 'string' || !cmd.trim()) throw new Error('Empty command.');
       const dir = resolveP(cwd);
       if (!(await fsp.stat(dir)).isDirectory()) throw new Error('Not a folder: ' + dir);
-      return { job: startJob(cmd, dir).id };
+      const j = startJob(cmd, dir);
+      return { job: j.id, pty: j.pty };
     },
 
-    jobs: () => [...jobs.values()].map((j) => ({ job: j.id, cmd: j.cmd, cwd: j.cwd, started: j.started, running: j.running, code: j.code })),
+    jobs: () => [...jobs.values()].map((j) => ({ job: j.id, cmd: j.cmd, cwd: j.cwd, started: j.started, running: j.running, code: j.code, pty: j.pty })),
 
     tail({ job, max = CHUNK * 4 }) {
       const j = jobs.get(job);
@@ -370,6 +409,15 @@ async function startClient(cfg) {
     kill({ job }) {
       const j = jobs.get(job);
       if (j?.running) killJob(j);
+    },
+
+    // Asked by the dashboard when it sees that this machine is behind the newest release.
+    update() {
+      if (!selfUpdate) throw new Error('This machine was not installed as a background client, so it cannot update itself.');
+      // Otherwise the dashboard would be told an update started that the choice saved here never lets happen.
+      if (loadConfig().autoupdate === false) throw new Error('Updates are turned off on this machine ("reach autoupdate on" turns them on).');
+      selfUpdate();
+      return { started: true };
     },
 
     'scripts.get': () => cfg.scripts || [],
@@ -392,12 +440,30 @@ async function startClient(cfg) {
 
   function startJob(cmd, cwd) {
     const win = process.platform === 'win32';
-    // Windows: switch the console to UTF-8 first, then hand the command to a second cmd.exe through a
-    // delayed-expansion variable so the outer shell never re-parses the user's quotes or operators.
-    const child = win
-      ? spawn('cmd.exe', ['/v:on', '/d', '/s', '/c', '"chcp 65001>nul & cmd.exe /d /s /c "!REACH_CMD!""'], { cwd, windowsVerbatimArguments: true, windowsHide: true, env: { ...process.env, REACH_CMD: cmd } })
-      : spawn(process.env.SHELL || 'sh', ['-c', cmd], { cwd, detached: true });
-    const j = { id: 'j' + ++jobSeq + boot, cmd, cwd, started: Date.now(), child, buf: Buffer.alloc(0), start: 0, cursor: 0, running: true, code: null, exitSent: false };
+    let run = cmd;
+    let pty = false;
+    let child;
+    if (win) {
+      // A Linux shell started without a terminal shows no prompt and looks dead, so open it inside a
+      // terminal that Linux itself provides.
+      const wsl = BARE_WSL.exec(cmd);
+      if (wsl) {
+        // "~" (start in the home folder) only counts when it comes first.
+        const home = /(^|\s)~(\s|$)/.test(wsl[1]) ? ' ~' : '';
+        const rest = wsl[1].replace(/(^|\s)~(?=\s|$)/g, '');
+        run = `wsl${home}${rest} -e sh -c "export TERM=dumb PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=; command -v script >/dev/null && exec script -qfc '${PTY_SIZE}; exec \${SHELL:-sh}' /dev/null; exec sh -i"`;
+        pty = true;
+      }
+      // Switch the console to UTF-8 first, then hand the command to a second cmd.exe through a
+      // delayed-expansion variable so the outer shell never re-parses the user's quotes or operators.
+      child = spawn('cmd.exe', ['/v:on', '/d', '/s', '/c', '"chcp 65001>nul & cmd.exe /d /s /c "!REACH_CMD!""'], { cwd, windowsVerbatimArguments: true, windowsHide: true, env: { ...process.env, WSL_UTF8: '1', REACH_CMD: run } });
+    } else if (hasPty()) {
+      pty = true;
+      child = spawn('script', ['-qfec', PTY_SIZE + '\n' + cmd, '/dev/null'], { cwd, detached: true, env: { ...process.env, ...PTY_ENV } });
+    } else {
+      child = spawn(process.env.SHELL || 'sh', ['-c', cmd], { cwd, detached: true });
+    }
+    const j = { id: 'j' + ++jobSeq + boot, cmd, cwd, started: Date.now(), child, buf: Buffer.alloc(0), start: 0, cursor: 0, running: true, code: null, exitSent: false, pty };
     jobs.set(j.id, j);
     const add = (d) => {
       j.buf = Buffer.concat([j.buf, d]);
@@ -418,7 +484,8 @@ async function startClient(cfg) {
     const finish = (code) => {
       if (!j.running) return;
       j.running = false;
-      j.code = code;
+      // The terminal wrapper reports success when it is stopped; a stopped job did not succeed.
+      j.code = j.killed && code === 0 ? 143 : code;
       const done = [...jobs.values()].filter((o) => !o.running);
       for (const old of done.slice(0, Math.max(0, jobs.size - MAX_JOBS))) jobs.delete(old.id);
     };
@@ -426,6 +493,7 @@ async function startClient(cfg) {
   }
 
   function killJob(j) {
+    j.killed = true;
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(j.child.pid), '/T', '/F'], { windowsHide: true }).on('error', () => {});
       return;
@@ -451,12 +519,13 @@ async function startClient(cfg) {
           const chunk = j.buf.subarray(j.cursor - j.start, Math.min(end, j.cursor + CHUNK) - j.start);
           link.send(key, T.out, { y: 'out', job: j.id, off: j.cursor }, chunk).catch(() => {});
           j.cursor += chunk.length;
-        } else if (!j.running && !j.exitSent) {
+        }
+        if (j.cursor >= end && !j.running && !j.exitSent) {
           j.exitSent = true;
           link.send(key, T.out, { y: 'exit', job: j.id, code: j.code, end }).catch(() => {});
         }
       }
-    }, 100)
+    }, 40)
   );
 
   // Drop uploads whose sender disappeared.
@@ -501,6 +570,7 @@ async function startClient(cfg) {
 
   return {
     dpub: cfg.dpub,
+    busy: () => reads.size > 0 || writes.size > 0 || [...jobs.values()].some((j) => j.running),
     async stop() {
       for (const t of timers) clearInterval(t);
       for (const j of jobs.values()) if (j.running) killJob(j);
@@ -556,10 +626,11 @@ function windowless(program) {
 }
 
 const programCache = new Map();
-async function programFor(target) {
+// fresh: always the newest release, even for this computer's own system.
+async function programFor(target, fresh = false) {
   if (!TARGETS.includes(target)) throw new Error('Unknown system: ' + target);
-  if (PACKED && target === ownTarget()) return fs.readFileSync(process.execPath);
-  if (!programCache.has(target)) {
+  if (!fresh && PACKED && target === ownTarget()) return fs.readFileSync(process.execPath);
+  if (fresh || !programCache.has(target)) {
     const url = `${RELEASES}reach-dashboard-${target}${target.startsWith('windows') ? '.exe' : ''}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Could not download ${url} (${res.status}).`);
@@ -679,8 +750,38 @@ async function makeKit(cfg, folder, targets) {
     fs.writeFileSync(file, stampClient(await programFor(t), pub, cfg.broker), { mode: 0o755 });
     console.log('done');
   }
+  cfg.kit = { folder, targets, version: PKG.version };
+  saveConfig(cfg);
   console.log('\nNext:\n  1. Start the dashboard program on this computer and choose your password. This computer is added by itself.');
   console.log('  2. Run a client program on any other computer. It appears on your dashboard by itself.');
+}
+
+// Client programs for the dashboard this computer is already on. Unlike a kit this makes no new dashboard,
+// so machines that are on the dashboard stay there.
+async function makeClients(cfg, folder, targets, fresh = false, version = PKG.version) {
+  for (const t of targets) if (!TARGETS.includes(t)) throw new Error(`Unknown system "${t}". Choose from: ${TARGETS.join(', ')}`);
+  if (!cfg.dpub) throw new Error('This computer is not on a dashboard yet, so there is no dashboard to make client programs for.');
+  fs.mkdirSync(folder, { recursive: true });
+  for (const t of targets) {
+    const file = path.join(folder, `reach-client-${t}${t.startsWith('windows') ? '.exe' : ''}`);
+    const program = await programFor(t, fresh);
+    // A program for another system cannot be tried out here, so at least it must be the release it should be.
+    if (fresh && !program.includes(`"version":"${version}"`)) throw new Error(`The download for ${t} is not version ${version}.`);
+    fs.writeFileSync(file + '.part', stampClient(program, cfg.dpub, cfg.broker), { mode: 0o755 });
+    fs.renameSync(file + '.part', file);
+    console.log('Made ' + file);
+  }
+  cfg.kit = { folder, targets, version };
+  saveConfig(cfg);
+}
+
+// When the dashboard program starts: brings the client programs it made earlier to the newest release.
+async function refreshKit(cfg) {
+  if (!cfg.kit?.folder || !cfg.dpub || !fs.existsSync(cfg.kit.folder)) return;
+  const latest = await latestVersion();
+  if (!latest || !newer(latest, cfg.kit.version)) return;
+  await makeClients(cfg, cfg.kit.folder, cfg.kit.targets, true, latest);
+  console.log(`The client programs in ${cfg.kit.folder} are now version ${latest}. They still belong to your dashboard.`);
 }
 
 // ---------- background service: install, autostart, tray icon ----------
@@ -729,6 +830,35 @@ function setAutostart(on, port) {
   fs.mkdirSync(path.dirname(autostartFile), { recursive: true });
   fs.writeFileSync(autostartFile, `[Desktop Entry]\nType=Application\nName=reach\nExec="${INSTALLED}" ${args}\nX-GNOME-Autostart-enabled=true\n`);
   return true;
+}
+
+// Starts the installed client through the Mac's own startup service. Returns false if that did not work.
+function startLaunchAgent() {
+  try {
+    const domain = 'gui/' + os.userInfo().uid;
+    spawnSync('launchctl', ['bootout', domain, launchAgent], { stdio: 'ignore' });
+    return spawnSync('launchctl', ['bootstrap', domain, launchAgent], { stdio: 'ignore' }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// Shown once, while someone is still sitting at the Mac: the one permission that stops macOS from asking
+// on this Mac's screen each time the dashboard opens a protected folder.
+function macAccessHelp(dpub) {
+  console.log(`\nOne more step, so that this Mac never asks for permission on its screen while you are away:
+  1. System Settings is opening at Privacy & Security > Full Disk Access.
+  2. Drag the file "reach" from the Finder window that is opening into that list, and switch it on.
+     (Or press + there, then Cmd+Shift+G, and type: ${INSTALLED})
+  3. Paste this line here so that it takes effect:
+       "${INSTALLED}" join ${dpub}
+Without this, macOS shows a question on this Mac's screen the first time the dashboard opens
+Desktop, Documents, Downloads or an external disk, and waits there for an answer.`);
+  for (const args of [['x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'], ['-R', INSTALLED]]) {
+    try {
+      spawn('open', args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref();
+    } catch {}
+  }
 }
 
 function hasAutostart() {
@@ -801,13 +931,58 @@ function startTray(onCommand) {
   return { update: (m) => child.stdin.write(JSON.stringify(m) + '\n'), close: () => child.stdin.end() };
 }
 
+// ---------- updates: the installed background client replaces itself when a newer release is out ----------
+
+const rejected = new Set();
+// Set by the installed background client: looks for a newer release now.
+let selfUpdate = null;
+
+async function latestVersion() {
+  const page = await fetch(REPO + '/latest', { redirect: 'manual', signal: AbortSignal.timeout(20000) });
+  return /\/tag\/v(\d+\.\d+\.\d+)$/.exec(page.headers.get('location') || '')?.[1] || null;
+}
+
+// Puts a newer program in the installed place. Returns its version when the caller should restart into it.
+// skip: a version that was installed before and did not come up.
+async function fetchUpdate(stamp, skip) {
+  // A changed program loses the Full Disk Access a Mac was given, and macOS would start asking on its screen again.
+  if (process.platform === 'darwin' && fullDiskAccess()) return null;
+  const latest = await latestVersion();
+  if (!latest || latest === skip || rejected.has(latest) || !newer(latest, PKG.version)) return null;
+  const win = process.platform === 'win32';
+  const res = await fetch(`${RELEASES}reach-dashboard-${ownTarget()}${win ? '.exe' : ''}`, { signal: AbortSignal.timeout(15 * 60000) });
+  // A release appears a few minutes before its programs are attached: try again at the next check.
+  if (!res.ok) return null;
+  const data = Buffer.from(await res.arrayBuffer());
+  const fresh = path.join(path.dirname(INSTALLED), win ? 'reach-new.exe' : 'reach-new');
+  fs.writeFileSync(fresh, stamp ? stampClient(data, stamp.pub, stamp.broker) : windowless(data), { mode: 0o755 });
+  // Only switch to a download that really runs on this machine and is the version it claims to be.
+  const check = spawnSync(fresh, ['--help'], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+  if (check.status !== 0 || !String(check.stdout).startsWith(`reach ${latest} `)) {
+    rejected.add(latest);
+    fs.rmSync(fresh, { force: true });
+    return null;
+  }
+  // A running program can be renamed but not overwritten.
+  const old = INSTALLED + '.old';
+  fs.rmSync(old, { force: true });
+  fs.renameSync(INSTALLED, old);
+  try {
+    fs.renameSync(fresh, INSTALLED);
+  } catch (e) {
+    fs.renameSync(old, INSTALLED);
+    throw e;
+  }
+  return latest;
+}
+
 // ---------- cli ----------
 
 async function main() {
   const { flags, rest } = parseArgs(process.argv.slice(2));
   const cmd = rest[0] || 'up';
   if (flags.help || cmd === 'help') return console.log(HELP);
-  if (!['up', 'pair', 'client', 'name', 'kit', 'stop', 'autostart', 'join'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
+  if (!['up', 'pair', 'client', 'name', 'kit', 'clients', 'stop', 'autostart', 'autoupdate', 'join'].includes(cmd)) throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
   const cfg = loadConfig();
   if (flags.name) cfg.name = flags.name;
   if (flags.broker !== undefined) cfg.broker = checkBroker(flags.broker);
@@ -840,6 +1015,10 @@ async function main() {
     if (stamp) throw new Error('This is a client program. Use the dashboard program to make a kit.');
     return makeKit(cfg, path.resolve(rest[1] || '.'), (flags.targets || 'windows-x64,linux-x64').split(','));
   }
+  if (cmd === 'clients') {
+    if (stamp) throw new Error('This is a client program. Use the dashboard program to make client programs.');
+    return makeClients(cfg, path.resolve(rest[1] || cfg.kit?.folder || '.'), (flags.targets || cfg.kit?.targets?.join(',') || 'windows-x64,linux-x64').split(','));
+  }
   if (cmd === 'stop') return console.log((await stopService(servicePort)) ? 'Stopped.' : 'The reach client is not running in the background.');
   if (cmd === 'autostart') {
     if (!['on', 'off'].includes(rest[1])) throw new Error('Usage: reach autostart on|off');
@@ -854,16 +1033,31 @@ async function main() {
     return console.log(cfg.autostart ? 'reach now starts with the computer.' : 'reach no longer starts with the computer.');
   }
 
+  if (cmd === 'autoupdate') {
+    if (!['on', 'off'].includes(rest[1])) throw new Error('Usage: reach autoupdate on|off');
+    cfg.autoupdate = rest[1] === 'on';
+    saveConfig(cfg);
+    return console.log(cfg.autoupdate ? 'The background client installs new versions by itself.' : 'The background client stays on this version until you install another.');
+  }
+
   // A client program hands over to an installed copy of itself that runs in the background and at startup.
   if (((cmd === 'up' && stamp) || (cmd === 'join' && PACKED)) && !flags.foreground && !flags.background) {
     await stopService(servicePort);
     install();
     if (cfg.autostart !== false) setAutostart(true, servicePort);
-    spawn(INSTALLED, ['--background', '--port', String(servicePort)], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-    for (let i = 0; i < 60 && !(await local(servicePort, 'ping'))?.reach; i++) await sleep(250);
+    const ping = async (tries) => {
+      for (let i = 0; i < tries && !(await local(servicePort, 'ping'))?.reach; i++) await sleep(250);
+      return !!(await local(servicePort, 'ping'))?.reach;
+    };
+    // On a Mac the startup service starts it, so that macOS sees the same program now as after a restart
+    // and a permission given to it once keeps counting.
+    const viaService = process.platform === 'darwin' && cfg.autostart !== false && startLaunchAgent() && (await ping(20));
+    if (!viaService) spawn(INSTALLED, ['--background', '--fresh', '--port', String(servicePort)], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    await ping(60);
     if (!(await local(servicePort, 'ping'))?.reach) throw new Error('reach did not start in the background. Try again with --foreground to see why.');
     console.log(`"${cfg.name}" is on your dashboard. reach keeps running in the background and starts with the computer.`);
     if (process.platform !== 'win32') console.log(`\nStop it with:           "${INSTALLED}" stop\nNo longer at startup:   "${INSTALLED}" autostart off`);
+    if (process.platform === 'darwin' && process.stdout.isTTY && !fullDiskAccess()) macAccessHelp(cfg.dpub);
     return;
   }
 
@@ -923,9 +1117,55 @@ async function main() {
   if (cfg.dpub && !(background && cfg.disabled) && !serviceRunning) state.client = await startClient(cfg);
 
   if (background) {
-    await serveDashboard(cfg, servicePort, state);
+    const server = await serveDashboard(cfg, servicePort, state);
+    if (PACKED && path.resolve(process.execPath) === INSTALLED) {
+      for (const left of ['.old', '.bad']) fs.rm(INSTALLED + left, { force: true }, () => {});
+      const start = () => spawn(INSTALLED, ['--background', '--port', String(servicePort)], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      let updating = false;
+      // Set once the new program is in place: a later check then only restarts. Fetching again would move the
+      // new program aside, and on Windows fail on the old one, which is still running.
+      let staged = null;
+      const update = async () => {
+        if (updating) return;
+        updating = true;
+        try {
+          // "reach autoupdate" is run as another program, so the choice is read from the saved file.
+          cfg.autoupdate = loadConfig().autoupdate;
+          // Never in the middle of a command or a file transfer; the next check comes soon enough.
+          if (cfg.autoupdate === false || state.client?.busy()) return;
+          if (!staged) staged = await fetchUpdate(stamp, cfg.badUpdate);
+          if (!staged || state.client?.busy()) return;
+          tray?.close();
+          await state.client?.stop();
+          server.close();
+          server.closeAllConnections?.();
+          await sleep(300);
+          start();
+          // If the new program does not come up, go back to this one rather than leave the machine off the
+          // dashboard, and do not try that version again.
+          let up = false;
+          for (let i = 0; i < 80 && !up; i++) up = (await local(servicePort, 'ping'))?.reach === staged || (await sleep(250));
+          if (!up) {
+            cfg.badUpdate = staged;
+            saveConfig(cfg);
+            fs.rmSync(INSTALLED + '.bad', { force: true });
+            fs.renameSync(INSTALLED, INSTALLED + '.bad');
+            fs.renameSync(INSTALLED + '.old', INSTALLED);
+            start();
+          }
+          process.exit(0);
+        } catch {
+        } finally {
+          updating = false;
+        }
+      };
+      selfUpdate = update;
+      setTimeout(update, Number(process.env.REACH_UPDATE_FIRST) || 60000);
+      setInterval(update, UPDATE_EVERY);
+    }
     tray = startTray(async (command) => {
-      if (command === 'ready') refreshTray(cfg.disabled ? 'reach is disabled. Right-click this icon to enable it.' : `"${cfg.name}" is on your dashboard. Right-click this icon to disable or quit.`);
+      // The notification is for the person who just installed it; ordinary startups stay silent.
+      if (command === 'ready') refreshTray(!flags.fresh ? '' : cfg.disabled ? 'reach is disabled. Right-click this icon to enable it.' : `"${cfg.name}" is on your dashboard. Right-click this icon to disable or quit.`);
       else if (command === 'open') state.openDashboard();
       else if (command === 'quit') state.quit();
       else if (command === 'autostart') {
@@ -966,6 +1206,7 @@ async function main() {
   console.log(`reach ${PKG.version} dashboard: ${url}\n\nIt opens in your browser and asks for your password. Keep this window open while you use it.`);
   if (cfg.dpub) console.log(`"${cfg.name}" is also on the dashboard while this stays open.`);
   if (!flags.noOpen) state.openDashboard();
+  refreshKit(cfg).catch(() => {});
 }
 
 main().catch((e) => {

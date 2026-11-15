@@ -8,6 +8,7 @@
 export const DEFAULT_BROKER = 'wss://broker.hivemq.com:8884/mqtt';
 export const CHUNK = 48 * 1024;
 const WINDOW = 6;
+const FIRST_WAIT = 1500;
 const EC = { name: 'ECDH', namedCurve: 'P-256' };
 
 const te = new TextEncoder();
@@ -31,6 +32,41 @@ const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0'))
 export const randId = (n = 8) => hex(crypto.getRandomValues(new Uint8Array(n)));
 const sha256hex = async (bytes) => hex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
 const err = (message, code) => Object.assign(new Error(message), { code });
+
+// ---------- releases ----------
+
+export const RELEASES = 'https://github.com/antoniolox1721/reach/releases/latest/download/';
+
+export const newer = (a, b) => {
+  const [x, y] = [a, b].map((v) => String(v).split('.').map(Number));
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return false;
+};
+
+// The release that fits a machine, from what the machine says about itself. Null when there is none.
+export function targetOf(info) {
+  if (info.os === 'mac') return info.arch === 'arm64' ? 'macos-arm64' : null;
+  if (info.os === 'linux' || info.os === 'wsl') return info.arch === 'x64' || info.arch === 'arm64' ? 'linux-' + info.arch : null;
+  return null;
+}
+
+// The Terminal line that puts a Mac or Linux machine on a dashboard.
+export function joinCommand(target, pub, broker, base = RELEASES) {
+  return `curl -fsSL ${base}reach-dashboard-${target} -o reach-setup && chmod +x reach-setup && ./reach-setup join ${checkPublic(pub)}${broker ? ' --broker ' + checkBroker(broker) : ''}; rm -f reach-setup`;
+}
+
+// For a machine that is already on the dashboard, run through its own client to bring it to the newest
+// version. It runs in the background, ignoring the stop signal that the old client sends to everything it
+// started when the new one takes over, and writes to a file because the old client's pipes go away with it.
+// The signals are ignored before the background part starts: in a terminal the hang-up sent when the outer
+// shell ends would otherwise arrive before a trap inside it has run. If the new program does not come up,
+// the one that was installed is put back and started, so the machine never drops off the dashboard.
+// It is handed to sh, since the machine's own shell may be one with another syntax.
+export function updateCommand(target, pub, broker, base = RELEASES) {
+  const join = `./reach-setup join ${checkPublic(pub)}${broker ? ' --broker ' + checkBroker(broker) : ''}`;
+  const back = '{ [ -f "$d/reach.prev" ] && mv -f "$d/reach.prev" "$d/reach" && { "$d/reach" --background & }; }';
+  return `sh -c 'trap "" TERM HUP; cd "\${TMPDIR:-/tmp}" && d="\${REACH_HOME:-$HOME/.reach}/bin" && (curl -fsSL ${base}reach-dashboard-${target} -o reach-setup && chmod +x reach-setup && { cp -f "$d/reach" "$d/reach.prev" 2>/dev/null; ${join} || ${back}; }; rm -f reach-setup "$d/reach.prev") > reach-update.log 2>&1 < /dev/null & echo "Updating reach in the background. This machine comes back on the dashboard in a moment."'`;
+}
 
 // ---------- identities ----------
 
@@ -139,34 +175,56 @@ export async function unseal(key, topic, payload) {
 
 // One connection to the relay. Messages are published and handed to route() strictly in order.
 export class Link {
-  // will: { topic, payload } prepared by the caller. route(topic, payload) may be async.
-  static open({ mqttConnect, broker, subscribe, will, onStatus, route }) {
+  // wills: two { topic, payload } prepared by the caller, one for each of the two connections that are
+  // started (see below); link.index says which of the two is in use. route(topic, payload) may be async.
+  static open({ mqttConnect, broker, subscribe, wills, onStatus, route, keep = 0 }) {
     const link = new Link();
-    link.tx = Promise.resolve();
     link.rx = Promise.resolve();
     link.unacked = 0;
     let ready;
     // Resolves once the relay has confirmed the subscriptions, so replies cannot be missed.
     link.ready = new Promise((r) => (ready = r));
-    const opts = { clientId: 'reach_' + randId(8), clean: true, keepalive: 30, reconnectPeriod: 2000, connectTimeout: 15000 };
-    if (will) opts.will = { ...will, qos: 1, retain: false };
-    const client = (link.client = mqttConnect(broker || DEFAULT_BROKER, opts));
-    client.on('connect', () => {
-      client.subscribe(subscribe, { qos: 1 }, () => {
-        ready();
-        onStatus?.('online');
+    const opts = { clean: true, keepalive: 20, reconnectPeriod: 300, connectTimeout: FIRST_WAIT };
+    // keep: the relay holds our subscriptions, and what arrives for them, for this many seconds while we are
+    // disconnected. Without it, answers that come back during a reconnection would be lost.
+    if (keep) Object.assign(opts, { protocolVersion: 5, clean: false, properties: { sessionExpiryInterval: keep } });
+    // The public relay takes several seconds to accept about one connection in three, while another made at
+    // the same moment is accepted at once. So two are started and the first one accepted is kept. Later
+    // reconnections give up on a slow attempt early, waiting longer each time in case the network is slow.
+    let chosen;
+    link.tx = new Promise((r) => (chosen = r));
+    link.all = [0, 1].map((i) => mqttConnect(broker || DEFAULT_BROKER, { ...opts, clientId: 'reach_' + randId(8), ...(wills ? { will: { ...wills[i], qos: 1, retain: false } } : {}) }));
+    for (const c of link.all) {
+      let accepted = false;
+      c.on('error', () => {});
+      c.on('connect', () => {
+        if (!link.client) {
+          link.client = c;
+          link.index = link.all.indexOf(c);
+          chosen();
+        }
+        if (link.client !== c) return void c.end();
+        accepted = true;
+        c.options.connectTimeout = FIRST_WAIT;
+        c.subscribe(subscribe, { qos: 1 }, () => {
+          ready();
+          onStatus?.('online');
+        });
       });
-    });
-    client.on('close', () => onStatus?.('offline'));
-    client.on('error', () => {});
-    client.on('message', (topic, payload) => {
-      link.rx = link.rx.then(() => route(topic, payload)).catch(() => {});
-    });
+      c.on('close', () => {
+        if (!accepted) c.options.connectTimeout = Math.min(15000, Math.round(c.options.connectTimeout * 1.6));
+        accepted = false;
+        if (link.client === c) onStatus?.('offline');
+      });
+      c.on('message', (topic, payload) => {
+        link.rx = link.rx.then(() => route(topic, payload)).catch(() => {});
+      });
+    }
     return link;
   }
 
   get connected() {
-    return this.client.connected;
+    return !!this.client?.connected;
   }
 
   // make: async () => Uint8Array
@@ -189,8 +247,19 @@ export class Link {
     return this.publish(topic, () => seal(key, topic, header, body), qos);
   }
 
+  // A device that slept can hold a connection that is dead without knowing it. Sends one small message and,
+  // if the relay does not confirm it soon, drops the connection so that a new one is made straight away.
+  check(topic, wait = 2500) {
+    const client = this.client;
+    if (!client?.connected) return;
+    const stream = client.stream;
+    // Closing politely would wait for an answer that a dead connection never gives, so it is torn down.
+    const timer = setTimeout(() => client.stream === stream && (client._cleanUp ? client._cleanUp(true) : stream.destroy()), wait);
+    client.publish(topic, new Uint8Array(0), { qos: 1 }, () => clearTimeout(timer));
+  }
+
   close() {
-    this.client.end(true);
+    for (const c of this.all) c.end(true);
   }
 }
 
@@ -307,6 +376,7 @@ export class Controller {
       broker: this.broker,
       subscribe: [`${base}/hello/+`, `${base}/+/re/${this.id}`, `${base}/+/out`],
       route: (topic, payload) => this._route(topic, payload),
+      keep: 120,
       onStatus: (s) => {
         if (s === 'online') this.link.publish(`${base}/who`, async () => new Uint8Array(0), 0).catch(() => {});
         this.onStatus?.(s);
@@ -318,6 +388,11 @@ export class Controller {
   stop() {
     clearInterval(this.sweep);
     this.link?.close();
+  }
+
+  // Call when the device comes back (screen on, network back): makes sure the connection is still alive.
+  wake() {
+    this.link?.check(`${this.base}/who`);
   }
 
   async _route(topic, payload) {
@@ -354,11 +429,12 @@ export class Controller {
     if (Math.abs(Date.now() - h.ts) > 10 * 60 * 1000) return;
     if (h.y === 'bye') {
       const m = this.machines.get(aid);
-      if (m && m.boot === h.boot) m.seen = 0;
+      // A goodbye left behind by the connection the client did not keep says nothing about the one it uses.
+      if (m && m.boot === h.boot && (h.c === undefined || m.c === undefined || h.c === m.c)) m.seen = 0;
     } else if (h.y === 'pres') {
       const prev = this.machines.get(aid);
       if (prev && prev.boot !== h.boot) this.sessions.delete(aid);
-      this.machines.set(aid, { id: aid, name: String(h.name), os: String(h.os), host: String(h.host), boot: h.boot, seen: Date.now() });
+      this.machines.set(aid, { id: aid, name: String(h.name), os: String(h.os), host: String(h.host), boot: h.boot, c: h.c, seen: Date.now() });
     }
     this._sweep();
   }

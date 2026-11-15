@@ -21,13 +21,13 @@ No VPN, no port forwarding, no account. Everything is end-to-end encrypted.
 
 On Linux and Mac make it runnable first: `chmod +x reach-dashboard-*`. The programs are not code-signed, so Windows SmartScreen shows "Windows protected your PC" the first time: choose *More info*, then *Run anyway*. On a Mac, right-click the file and choose *Open*.
 
-**2. Start it.** Your browser opens the dashboard at `http://127.0.0.1:7700`. Choose **Create my dashboard** and pick a password. You type that password every time you open the dashboard.
+**2. Start it.** Your browser opens the dashboard at `http://127.0.0.1:7700`. Choose **Create my dashboard** and pick a password. You type that password when you open the dashboard; it stays open in that browser tab until you close the tab or press **Lock**.
 
-**3. Add computers.** Under **Add a machine**, download the **client program** for Windows or Linux. Copy it to a computer and run it there. The computer appears on your dashboard a few seconds later, with no questions asked, and stays on it (see [the client in the background](#the-client-in-the-background)). You can reuse the same client file on as many computers as you like, including the one the dashboard is on.
+**3. Add computers.** Choose **Add a machine**, say what you are adding, and download the **client program** for Windows or Linux. Copy it to a computer and run it there. The computer appears on your dashboard a few seconds later, with no questions asked, and stays on it (see [the client in the background](#the-client-in-the-background)). You can reuse the same client file on as many computers as you like, including the one the dashboard is on.
 
 **4. Or add only this computer for now.** **Add this computer** puts the dashboard's own computer in the list, but only for as long as the dashboard program's window is open. Run the client program on it instead to keep it reachable.
 
-**5. Use it from your phone.** Under **Add a machine**, choose **Show QR code** and scan it with your phone. The phone opens the dashboard at <https://antoniolox1721.github.io/reach/> and asks you to choose a password for the phone. From then on that page is your dashboard on the phone.
+**5. Use it from your phone.** Choose **Add a machine**, then **Open this dashboard on my phone**, and scan the code with your phone. The phone opens the dashboard at <https://antoniolox1721.github.io/reach/> and asks you to choose a password for the phone. From then on that page is your dashboard on the phone.
 
 ### Everything prepared in one go
 
@@ -56,6 +56,10 @@ Running a client program does three things and then returns at once:
 - **Quit**: stop it until the next start.
 
 **On Linux** there is no icon. Use `~/.reach/bin/reach stop` to stop it and `~/.reach/bin/reach autostart off` to keep it from starting at login. Starting at login uses the desktop's autostart folder, so a server without a desktop session needs its own service entry running `~/.reach/bin/reach --background`.
+
+**Updates.** The background client looks for a new release every few hours and installs it by itself, never in the middle of a command or a transfer; `reach autoupdate off` stops that. Opening a machine on the dashboard also brings it up to date. A Mac that was given Full Disk Access is left alone, because macOS withdraws that permission from a changed program. Client programs you made earlier are brought up to date with `reach clients <folder>`, which keeps your dashboard; the dashboard program also does this by itself when it starts.
+
+**On a Mac**, macOS asks on the Mac's own screen before a program may open Desktop, Documents, Downloads or an external disk, and waits there for an answer. To stop that, give `~/.reach/bin/reach` *Full Disk Access* once (System Settings, Privacy & Security); the line you paste to add the Mac opens that page for you.
 
 The dashboard program is different on purpose: it is an ordinary window that you open when you want your dashboard and close when you are done.
 
@@ -94,9 +98,9 @@ iPhones can use the dashboard but cannot be a machine on it.
 
 - **My machines**: every machine that is online. Tap one to open it.
 - **Files**: browse folders, tap a file to open (text and images), edit and save, download, rename or delete. *Upload* sends files from the device you are holding. A folder's `⋯` menu has *Download as zip* (the whole folder with everything inside, up to 2 GB) and *Open terminal here*.
-- **Terminal**: type a command, see the output live. `cd` works. While a program runs you can type input for it or press *Stop*. Jobs keep running if you close the page or lose signal; tap a job under *Jobs* to pick its output back up.
+- **Terminal**: type a command, see the output live. `cd` works. While a program runs you can type input for it or press *Stop*. On Linux, and for `wsl` on Windows, commands run in a real terminal: prompts and password questions appear, and *^C* interrupts what is running. Jobs keep running if you close the page or lose signal; tap a job under *Jobs* to pick its output back up.
 - **Scripts**: save commands you run often (name, command, folder) and start them with one tap. They are stored on the machine they belong to.
-- **Lock**: closes the dashboard until the password is typed again.
+- **Lock**: closes the dashboard until the password is typed again. Without it, the dashboard stays open in that tab, also across reloads.
 
 ## Commands
 
@@ -110,6 +114,8 @@ reach join <address>  put this machine on the dashboard with that address, in th
                       at every startup (the dashboard shows the full line to paste)
 reach stop            stop the background client
 reach autostart on|off   whether the client starts with the computer
+reach autoupdate on|off  whether the background client installs new versions by itself (default on)
+reach clients [folder]   make client programs again for the dashboard this computer is on
 reach kit [folder]    prepare a new dashboard for this computer plus Windows and Linux client programs
 reach pair            show a one-time code to add this machine to a dashboard, then stay online
 reach client          stay online without opening the dashboard (after this machine was added)
@@ -142,13 +148,13 @@ What you need to do:
 - Choose a good password. It is all that stands between someone using your computer or phone and all your machines.
 - The **phone QR code contains the dashboard key**. Show it only to your own phone. Anyone who photographs it has full access.
 - Run client programs only on machines you are happy to have on your dashboard, and only client programs you downloaded from your own dashboard: a machine obeys whichever dashboard its client program belongs to.
-- A leaked client file lets a stranger make *their* machine show up in your list (they still cannot control anything). Machines you have not opened before on a device are marked **new** and ask before opening: do not open ones you do not recognise.
+- A leaked client file lets a stranger make *their* machine show up in your list (they still cannot control anything). Machines you have not opened before on a device are marked **new**: do not open ones you do not recognise.
 - If the dashboard key may have leaked (lost phone with a weak password, photographed QR code), choose *Forget this device* on every device, create a new dashboard, and download new client programs for your machines. A machine switches dashboards when you run a new client program on it.
 - The public page is served from this GitHub repository. If you would rather not depend on that for your phone, fork the repository and host the `docs/` folder yourself.
 
 ## Limits
 
-- Commands run through the machine's shell (`cmd.exe` on Windows, `$SHELL` elsewhere), one process per command. Full-screen terminal programs such as `vim` or `htop` do not work.
+- Commands run through the machine's shell (`cmd.exe` on Windows, `$SHELL` elsewhere), one process per command. Full-screen terminal programs such as `vim` or `htop` do not work. On Windows and on a Mac, programs get no real terminal (except `wsl`), so ones that insist on one, such as an interactive `python`, show nothing.
 - The default relay is the free public HiveMQ broker. It is fine for commands and ordinary files (a few hundred KB/s to a few MB/s), has no uptime guarantee, and connecting occasionally takes several seconds. For heavy use point every program at your own relay with `--broker wss://...` (any MQTT broker with WebSocket support, for example Mosquitto).
 - Downloads are assembled in the browser's memory, so very large files (many hundreds of MB) are better moved another way. Files up to 2 MB can be opened and edited in the page.
 - The terminal keeps the last 1 MB of each job's output and remembers the last 30 jobs until the program is restarted.

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 
 if (!globalThis.crypto) globalThis.crypto = nodeCrypto.webcrypto;
-const { Controller, newSecret, publicOf, fleetBase, channelKey, seal, pairOffer, DEFAULT_BROKER } = await import('../docs/core.js');
+const { Controller, newSecret, publicOf, fleetBase, channelKey, seal, pairOffer, updateCommand, DEFAULT_BROKER } = await import('../docs/core.js');
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reach-test-'));
@@ -24,8 +24,8 @@ const PORT = 7790 + Math.floor(Math.random() * 100);
 const children = [];
 const reach = (args, home, opts = {}) => {
   // A real background client may be running on this computer; keep the test's programs from deferring to it.
-  const env = { ...process.env, REACH_HOME: path.join(tmp, home), REACH_SERVICE_PORT: String(PORT + 9) };
-  const child = BIN ? spawn(BIN, args, { env, ...opts }) : spawn(process.execPath, [path.join(root, 'reach.js'), ...args], { env, ...opts });
+  const env = { ...process.env, REACH_HOME: path.join(tmp, home), REACH_SERVICE_PORT: String(PORT + 9), ...opts.env };
+  const child = BIN ? spawn(BIN, args, { ...opts, env }) : spawn(process.execPath, [path.join(root, 'reach.js'), ...args], { ...opts, env });
   children.push(child);
   return child;
 };
@@ -132,9 +132,57 @@ step('stdin reaches a running job, and kill stops one', async () => {
   assert.notEqual((await killed).code, 0);
 });
 
+if (!win && spawnSync('script', ['--version']).status === 0)
+  step('commands run in a real terminal: prompts appear and Ctrl+C interrupts', async () => {
+    const a = await ctl.call(id, 'exec', { cmd: 'tty && read -p "name? " n && echo "got $n"', cwd: work });
+    assert.equal(a.r.pty, true);
+    const done = collect(a.r.job);
+    await sleep(1500);
+    await ctl.call(id, 'stdin', { job: a.r.job }, Buffer.from('bob\n'));
+    const out = await done;
+    assert.match(out.text, /\/dev\/(pts|tty)/);
+    assert.match(out.text, /name\? [\s\S]*got bob/);
+    assert.equal(out.code, 0);
+    const b = await ctl.call(id, 'exec', { cmd: 'sleep 60; echo not-interrupted', cwd: work });
+    const stopped = collect(b.r.job);
+    await sleep(1000);
+    await ctl.call(id, 'stdin', { job: b.r.job }, Buffer.from('\x03'));
+    const end = await stopped;
+    assert.equal(end.code, 130);
+    assert.doesNotMatch(end.text, /not-interrupted/);
+    assert.equal((await ctl.call(id, 'jobs')).r.find((j) => j.job === a.r.job).pty, true);
+  });
+
+step('a connection that died is noticed and replaced at once', async () => {
+  const t0 = Date.now();
+  // Silence the connection without closing it, like a phone that slept.
+  const stream = ctl.link.client.stream;
+  stream.write = () => true;
+  ctl.wake();
+  const { r } = await ctl.call(id, 'jobs');
+  assert.ok(Array.isArray(r));
+  assert.notEqual(ctl.link.client.stream, stream, 'a new connection was made');
+  assert.ok(Date.now() - t0 < 12000, 'recovered quickly, took ' + (Date.now() - t0) + ' ms');
+});
+
+step('a goodbye left by the connection a client did not keep does not make it look offline', async () => {
+  const m = online('test box');
+  assert.ok(m.c === 0 || m.c === 1, 'the client says which connection it uses');
+  ctl._presence(id, { y: 'bye', boot: m.boot, c: 1 - m.c, ts: Date.now() });
+  assert.ok(online('test box'), 'still online');
+  ctl._presence(id, { y: 'bye', boot: m.boot, c: m.c, ts: Date.now() });
+  assert.ok(!online('test box'), 'a goodbye from the connection in use counts');
+  await ctl.link.publish(`${ctl.base}/who`, async () => new Uint8Array(0), 0);
+  await until(() => online('test box'), 'the client announcing itself again');
+});
+
 step('saved scripts persist on the machine', async () => {
   await ctl.call(id, 'scripts.set', { scripts: [{ name: 'hello', cmd: 'echo hi', cwd: work }] });
   assert.deepEqual((await ctl.call(id, 'scripts.get')).r, [{ name: 'hello', cmd: 'echo hi', cwd: work }]);
+});
+
+step('a client that was not installed in the background refuses to update itself', async () => {
+  await assert.rejects(ctl.call(id, 'update'), /not installed as a background client/);
 });
 
 step('a machine joins with a pairing code', async () => {
@@ -264,6 +312,228 @@ if (BIN)
       await sh(installed, ['autostart', 'off', '--port', String(sport)]);
     }
   });
+
+if (BIN)
+  step('the background client installs a newer release by itself, and refuses one that is not what it claims', async () => {
+    const sport = PORT + 4;
+    const current = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+    const file = `reach-dashboard-${win ? 'windows' : process.platform}-${process.arch}${win ? '.exe' : ''}`;
+    // The same program with only its version number changed stands in for the next release.
+    const next = Buffer.from(fs.readFileSync(BIN).toString('latin1').replaceAll(`"version":"${current}"`, '"version":"9.9.9"'), 'latin1');
+    let tag = '9.9.8';
+    let served = 0;
+    const releases = http.createServer((req, res) => {
+      if (req.url === '/latest') return res.writeHead(302, { location: `http://127.0.0.1:${sport + 1}/tag/v${tag}` }).end();
+      if (req.url !== '/latest/download/' + file) return res.writeHead(404).end();
+      served++;
+      res.writeHead(200).end(tag === '9.9.9' ? next : fs.readFileSync(BIN));
+    });
+    await new Promise((r) => releases.listen(sport + 1, '127.0.0.1', r));
+    const env = { ...process.env, REACH_HOME: path.join(tmp, 'home9'), REACH_RUN_NAME: 'reach-selftest', REACH_NO_TRAY: '1', REACH_RELEASES: `http://127.0.0.1:${sport + 1}`, REACH_UPDATE_FIRST: '2000', REACH_UPDATE_EVERY: '4000' };
+    const sh = (f, args) => new Promise((r) => spawn(f, args, { env, stdio: 'ignore' }).on('close', r));
+    const installed = path.join(tmp, 'home9', 'bin', win ? 'reach.exe' : 'reach');
+    const version = async () => (await ctl.call(online('update box').id, 'info')).r.version;
+    try {
+      assert.equal(await sh(BIN, ['join', pub, '--name', 'update box', '--port', String(sport)]), 0);
+      await until(() => online('update box'), 'client online');
+      const box = online('update box').id;
+      await until(() => served > 0, 'the release that is not what it claims was downloaded');
+      await sleep(3000);
+      assert.equal(await version(), current, 'a download reporting another version is not installed');
+      assert.equal(served, 1, 'and it is not downloaded again');
+      tag = '9.9.9';
+      await until(async () => (await version().catch(() => '')) === '9.9.9', 'the client runs the new version', 60000);
+      assert.equal(online('update box').id, box, 'it is still the same machine');
+      const { r } = await ctl.call(box, 'exec', { cmd: 'echo after-update', cwd: work });
+      assert.match((await collect(r.job, box)).text, /after-update/);
+      assert.equal(await sh(installed, ['autoupdate', 'off', '--port', String(sport)]), 0);
+    } finally {
+      releases.close();
+      await sh(installed, ['stop', '--port', String(sport)]);
+      await sh(installed, ['autostart', 'off', '--port', String(sport)]);
+    }
+  });
+
+const ownTarget = `${win ? 'windows' : process.platform}-${process.arch}`;
+const exeName = (t) => t + (t.startsWith('windows') ? '.exe' : '');
+const currentVersion = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+// Stands in for the release page: the newest release is 9.9.9, which is this program with only its version changed.
+// broken: that release answers --help but can no longer run in the background.
+const fakeReleases = async (port, broken = false) => {
+  let text = fs.readFileSync(BIN).toString('latin1').replaceAll(`"version":"${currentVersion}"`, '"version":"9.9.9"');
+  if (broken) {
+    assert.ok(text.includes('a === "--background"'));
+    text = text.replaceAll('a === "--background"', 'a === "--backgroune"');
+  }
+  const next = Buffer.from(text, 'latin1');
+  const r = { served: 0 };
+  r.server = http.createServer((req, res) => {
+    if (req.url === '/latest') return res.writeHead(302, { location: `http://127.0.0.1:${port}/tag/v9.9.9` }).end();
+    if (req.url !== '/latest/download/reach-dashboard-' + exeName(ownTarget)) return res.writeHead(404).end();
+    r.served++;
+    res.writeHead(200).end(next);
+  });
+  await new Promise((ok) => r.server.listen(port, '127.0.0.1', ok));
+  r.url = `http://127.0.0.1:${port}`;
+  return r;
+};
+const config = (home) => JSON.parse(fs.readFileSync(path.join(tmp, home, 'config.json'), 'utf8'));
+const exitOf = (child) => new Promise((r) => child.on('close', r));
+
+if (BIN)
+  step('clients: client programs for the dashboard this computer is already on, without a new dashboard', async () => {
+    fs.mkdirSync(path.join(tmp, 'home10'));
+    fs.writeFileSync(path.join(tmp, 'home10', 'config.json'), JSON.stringify({ dpub: pub }));
+    const dir = path.join(tmp, 'clients');
+    assert.equal(await exitOf(reach(['clients', dir, '--targets', ownTarget], 'home10', { stdio: 'ignore' })), 0);
+    const exe = path.join(dir, 'reach-client-' + exeName(ownTarget));
+    assert.ok(fs.existsSync(exe), 'client program made');
+    const cfg = config('home10');
+    assert.equal(cfg.dpub, pub, 'still the same dashboard');
+    assert.ok(!('pending' in cfg), 'no new dashboard key');
+    assert.deepEqual(cfg.kit, { folder: dir, targets: [ownTarget], version: currentVersion });
+    const run = spawn(exe, ['--foreground', '--name', 'clients box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home11') }, stdio: 'ignore' });
+    children.push(run);
+    await until(() => online('clients box'), 'client program from "reach clients" online');
+    run.kill();
+  });
+
+if (BIN)
+  step('the dashboard program brings the client programs it made to the newest release when it starts', async () => {
+    const releases = await fakeReleases(PORT + 11);
+    try {
+      const desk = reach(['--no-open', '--port', String(PORT + 10), '--name', 'refresh desk'], 'home10', { stdio: 'ignore', env: { REACH_RELEASES: releases.url } });
+      await until(() => config('home10').kit?.version === '9.9.9', 'client programs refreshed', 60000);
+      const cfg = config('home10');
+      assert.equal(cfg.dpub, pub, 'still the same dashboard');
+      assert.ok(!('pending' in cfg), 'no new dashboard key');
+      const exe = path.join(tmp, 'clients', 'reach-client-' + exeName(ownTarget));
+      const data = fs.readFileSync(exe);
+      assert.ok(data.includes('"version":"9.9.9"'), 'the client program is the new release');
+      assert.ok(data.subarray(-200).toString('latin1').endsWith(`\n#REACH-CLIENT#p=${pub}#END#\n`), 'and still belongs to this dashboard');
+      assert.deepEqual(fs.readdirSync(path.join(tmp, 'clients')), ['reach-client-' + exeName(ownTarget)], 'no partial files left');
+      const run = spawn(exe, ['--foreground', '--name', 'refreshed box'], { env: { ...process.env, REACH_HOME: path.join(tmp, 'home11r') }, stdio: 'ignore' });
+      children.push(run);
+      await until(() => online('refreshed box'), 'refreshed client program online');
+      assert.equal((await ctl.call(online('refreshed box').id, 'info')).r.version, '9.9.9');
+      run.kill();
+      desk.kill();
+      await exitOf(desk);
+      // Started again, the program finds nothing newer and leaves the client programs alone.
+      const served = releases.served;
+      const again = reach(['--no-open', '--port', String(PORT + 10), '--name', 'refresh desk'], 'home10', { stdio: ['ignore', 'pipe', 'ignore'], env: { REACH_RELEASES: releases.url } });
+      let out = '';
+      again.stdout.on('data', (d) => (out += d));
+      await until(() => /dashboard: http/.test(out), 'dashboard program started again');
+      await sleep(3000);
+      assert.equal(releases.served, served, 'nothing downloaded again');
+      again.kill();
+    } finally {
+      releases.server.close();
+    }
+  });
+
+// Starts a background client through "join" with its own service port, and stops it again afterwards.
+const background = async (home, sport, name, extra, fn, broken = false) => {
+  const releases = await fakeReleases(sport + 1, broken);
+  const env = { ...process.env, REACH_HOME: path.join(tmp, home), REACH_SERVICE_PORT: String(sport), REACH_RUN_NAME: 'reach-selftest', REACH_NO_TRAY: '1', REACH_RELEASES: releases.url, ...extra };
+  const sh = (f, args) => new Promise((r) => spawn(f, args, { env, stdio: 'ignore' }).on('close', r));
+  const installed = path.join(tmp, home, 'bin', win ? 'reach.exe' : 'reach');
+  try {
+    assert.equal(await sh(BIN, ['join', pub, '--name', name]), 0);
+    await until(() => online(name), 'background client online');
+    const box = online(name).id;
+    const version = async () => (await ctl.call(box, 'info')).r.version;
+    assert.equal(await version(), currentVersion);
+    await fn({ box, version, sh, installed, releases, sport });
+    assert.equal(online(name)?.id, box, 'it is still the same machine');
+    const { r } = await ctl.call(box, 'exec', { cmd: 'echo after-update', cwd: work });
+    assert.match((await collect(r.job, box)).text, /after-update/);
+  } finally {
+    releases.server.close();
+    await sh(installed, ['stop']);
+    await sh(installed, ['autostart', 'off']);
+  }
+};
+
+if (BIN && !win)
+  step('an older client is brought to the newest release through its terminal (Mac and Linux)', () =>
+    background('home12', PORT + 12, 'old box', { TMPDIR: tmp }, async ({ box, version, sh, installed, releases, sport }) => {
+      // Its own updates are off, so only the line sent through its terminal can update it. That line works in
+      // TMPDIR, which is the test's folder here.
+      assert.equal(await sh(installed, ['autoupdate', 'off']), 0);
+      const cmd = updateCommand('linux-' + process.arch, pub, '', releases.url + '/latest/download/');
+      const { r } = await ctl.call(box, 'exec', { cmd, cwd: work });
+      assert.match((await collect(r.job, box)).text, /Updating reach in the background/);
+      try {
+        await until(async () => (await version().catch(() => '')) === '9.9.9', 'the client runs the new version', 60000);
+      } catch (e) {
+        const log = path.join(tmp, 'reach-update.log');
+        throw new Error(e.message + '; reach-update.log: ' + (fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '(none)'));
+      }
+      assert.equal(releases.served, 1);
+      assert.match(fs.readFileSync(path.join(tmp, 'reach-update.log'), 'utf8'), /"old box" is on your dashboard/);
+      assert.equal(config('home12').autoupdate, false, 'its choice is kept');
+      assert.equal((await fetch(`http://127.0.0.1:${sport}/api/ping`).then((x) => x.json())).reach, '9.9.9', 'the new version runs in the background');
+    })
+  );
+
+if (BIN && !win)
+  step('a release that does not come up is undone: the machine stays on the dashboard (through its terminal)', () =>
+    background(
+      'home14',
+      PORT + 16,
+      'safe box',
+      { TMPDIR: path.join(tmp, 'home14') },
+      async ({ box, version, sh, installed, releases, sport }) => {
+        assert.equal(await sh(installed, ['autoupdate', 'off']), 0);
+        const { r } = await ctl.call(box, 'exec', { cmd: updateCommand('linux-' + process.arch, pub, '', releases.url + '/latest/download/'), cwd: work });
+        await collect(r.job, box);
+        await until(() => releases.served === 1, 'the release was downloaded');
+        // The new program stops the old client, fails to start, and the old one is put back and started.
+        await until(async () => (await fetch(`http://127.0.0.1:${sport}/api/ping`).then((x) => x.json(), () => null))?.reach === currentVersion && !fs.existsSync(installed + '.prev'), 'the previous program runs again', 90000);
+        await until(async () => (await version().catch(() => '')) === currentVersion, 'it answers on the dashboard', 30000);
+      },
+      true
+    )
+  );
+
+if (BIN)
+  step('a release that does not come up is undone: the machine stays on the dashboard (its own update)', () =>
+    background(
+      'home15',
+      PORT + 18,
+      'steady box',
+      { REACH_UPDATE_FIRST: '100000000', REACH_UPDATE_EVERY: '100000000' },
+      async ({ box, version, installed, releases, sport }) => {
+        assert.deepEqual((await ctl.call(box, 'update')).r, { started: true });
+        await until(() => config('home15').badUpdate === '9.9.9', 'the release was tried and given up', 90000);
+        await until(async () => (await fetch(`http://127.0.0.1:${sport}/api/ping`).then((x) => x.json(), () => null))?.reach === currentVersion, 'the previous program runs again', 30000);
+        await until(async () => (await version().catch(() => '')) === currentVersion, 'it answers on the dashboard', 30000);
+        assert.ok(!fs.readFileSync(installed).toString('latin1').includes('"version":"9.9.9"'), 'the installed program is the previous one');
+        assert.deepEqual((await ctl.call(box, 'update')).r, { started: true });
+        await sleep(4000);
+        assert.equal(releases.served, 1, 'that release is not downloaded again');
+      },
+      true
+    )
+  );
+
+if (BIN)
+  step('the dashboard can ask a background client to update now', () =>
+    // Timers far away, so only the request can start the update.
+    background('home13', PORT + 14, 'asked box', { REACH_UPDATE_FIRST: '100000000', REACH_UPDATE_EVERY: '100000000' }, async ({ box, version, sh, installed, releases }) => {
+      assert.equal(await sh(installed, ['autoupdate', 'off']), 0);
+      await assert.rejects(ctl.call(box, 'update'), /turned off/, 'refused while its updates are off');
+      assert.equal(await sh(installed, ['autoupdate', 'on']), 0);
+      await sleep(2000);
+      assert.equal(releases.served, 0, 'nothing downloaded before it was asked');
+      assert.equal(await version(), currentVersion);
+      assert.deepEqual((await ctl.call(box, 'update')).r, { started: true });
+      await until(async () => (await version().catch(() => '')) === '9.9.9', 'the client runs the new version', 60000);
+      assert.equal(releases.served, 1);
+    })
+  );
 
 step('knowing the dashboard address (what a client program holds) is not enough to control a machine', async () => {
   const base = await fleetBase(pub);

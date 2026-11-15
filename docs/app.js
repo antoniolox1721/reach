@@ -1,4 +1,4 @@
-import { Controller, parseLink, newSecret, pairOffer, normalizePairCode, b64u } from './core.js';
+import { Controller, parseLink, newSecret, pairOffer, normalizePairCode, joinCommand, updateCommand, targetOf, newer, b64u } from './core.js';
 
 const VAULT = 'reach.vault2';
 const PAGES = 'https://antoniolox1721.github.io/reach/';
@@ -78,24 +78,53 @@ let screen = 'boot';
 let claimToken = ''; // proves this page was opened by the reach program, which lets it collect a prepared dashboard key
 let pendingPair = null; // pairing code that arrived in the link, handled after unlock
 
-function setHeader(title, back) {
+// door: a sign-in screen, which shows the name itself, so the header bar is left out.
+function setHeader(title, back, door = false) {
+  $('header').hidden = door;
   $('#title').textContent = title;
   $('#back').hidden = !back;
   $('#lock').hidden = !ctl;
 }
 
 function setStatus(s) {
+  $('#link').hidden = !ctl;
+  $('#link').classList.toggle('on', s === 'online');
   $('#status').className = 'dot ' + (s === 'online' ? 'on' : s === 'offline' ? 'off' : '');
+  $('#statustext').textContent = s === 'online' ? 'Connected' : 'Connecting…';
 }
 
 $('#back').addEventListener('click', () => history.back());
+// A phone or laptop that slept may come back with a dead connection: check it at once instead of letting commands hang.
+document.addEventListener('visibilitychange', () => document.hidden || ctl?.wake());
+window.addEventListener('online', () => ctl?.wake());
 $('#lock').addEventListener('click', lock);
 window.addEventListener('popstate', () => {
   if (current) closeMachine();
+  else if (screen === 'add') showMachines();
 });
 
+const mark = () => h('div', { class: 'mark' }, h('img', { src: 'icon.svg', alt: '' }), h('b', null, 'reach'));
+
+// While this tab stays open the dashboard stays unlocked, so a reload (or a phone that put the tab to
+// sleep) does not ask for the password again. Closing the tab or pressing Lock ends it.
+const OPEN = 'reach.open';
+const session = {
+  get() {
+    try {
+      return JSON.parse(sessionStorage.getItem(OPEN));
+    } catch {
+      return null;
+    }
+  },
+  set(s) {
+    try {
+      s ? sessionStorage.setItem(OPEN, JSON.stringify(s)) : sessionStorage.removeItem(OPEN);
+    } catch {}
+  },
+};
+
 function lock() {
-  adding = false;
+  session.set(null);
   ctl?.stop();
   ctl = null;
   secret = null;
@@ -145,14 +174,14 @@ function qrCanvas(text) {
 
 function showUnlock() {
   screen = 'unlock';
-  setHeader('reach', false);
-  const pw = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Password' });
-  const msg = h('p', { class: 'error' });
-  const go = h('button', { class: 'primary', type: 'submit' }, 'Unlock');
+  setHeader('reach', false, true);
+  const pw = h('input', { id: 'pw', type: 'password', autocomplete: 'current-password' });
+  const msg = h('p', { class: 'error', role: 'alert' });
+  const go = h('button', { class: 'primary wide', type: 'submit' }, 'Unlock');
   const form = h(
     'form',
     {
-      class: 'pad',
+      class: 'door',
       onsubmit: async (e) => {
         e.preventDefault();
         go.disabled = true;
@@ -165,7 +194,8 @@ function showUnlock() {
         }
       },
     },
-    h('div', { class: 'card' }, h('p', null, 'Enter your password to open your dashboard.'), h('label', null, 'Password'), pw, msg, h('div', { class: 'row' }, go)),
+    mark(),
+    h('div', { class: 'card' }, h('h2', null, 'Open your dashboard'), h('label', { for: 'pw' }, 'Password'), pw, msg, go),
     h(
       'button',
       {
@@ -174,6 +204,7 @@ function showUnlock() {
         onclick: () => {
           if (!confirm('Remove the dashboard from this device? If no other device has it, you lose access to your machines and must set them up again.')) return;
           localStorage.removeItem(VAULT);
+          session.set(null);
           showSetup();
         },
       },
@@ -188,19 +219,19 @@ function showUnlock() {
 // mode 'claim': a dashboard that "reach kit" prepared on this computer; only the password is missing.
 function showSetup(mode = 'create', fromLink = null) {
   screen = 'setup';
-  setHeader('reach', false);
+  setHeader('reach', false, true);
   const hadVault = !!localStorage.getItem(VAULT);
   const claiming = mode === 'claim';
   const importing = mode === 'import';
   const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Dashboard link or key' });
   const pw1 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'At least 8 characters' });
   const pw2 = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'Repeat the password' });
-  const msg = h('p', { class: 'error' });
+  const msg = h('p', { class: 'error', role: 'alert' });
   const go = h('button', { class: 'primary', type: 'submit' }, claiming ? 'Open my dashboard' : importing ? 'Save and open' : 'Create my dashboard');
   const form = h(
     'form',
     {
-      class: 'pad',
+      class: 'door',
       onsubmit: async (e) => {
         e.preventDefault();
         msg.textContent = '';
@@ -226,14 +257,16 @@ function showSetup(mode = 'create', fromLink = null) {
         }
       },
     },
+    mark(),
     h(
       'div',
       { class: 'card' },
+      h('h2', null, claiming ? 'Choose your password' : importing ? 'Open your existing dashboard' : 'Create your dashboard'),
       importing
         ? h('p', null, fromLink ? 'Dashboard key received from the link. Only continue if you made this link yourself, on your own dashboard.' : 'Paste the link or key of your existing dashboard.')
         : claiming
           ? h('p', null, 'Your dashboard is ready. Choose the password that protects it. You type it each time you open the dashboard.')
-          : h('p', null, 'Create your dashboard. It is protected by a password that you type each time you open it.'),
+          : h('p', null, 'One password protects it. You type it when you open the dashboard.'),
       claiming && hadVault && h('p', { class: 'error' }, 'This browser already has a dashboard. Continuing replaces it with the newly prepared one.'),
       fromLink && hadVault && h('p', { class: 'error' }, 'This device already has a dashboard. Continuing replaces it with the one from the link.'),
       fromLink?.broker && h('p', { class: 'small' }, 'This link uses a custom relay: ', h('code', null, fromLink.broker)),
@@ -258,12 +291,13 @@ function showSetup(mode = 'create', fromLink = null) {
 async function showPairHere() {
   const { code } = await api('pair', {});
   screen = 'pairhere';
+  setHeader('reach', false, true);
   const state = h('p', { class: 'dim' }, 'Waiting for you to approve it on your dashboard…');
   view.replaceChildren(
     h(
       'div',
-      { class: 'pad' },
-      h('div', { class: 'card center' }, h('p', null, 'On your dashboard choose "Add a machine" and enter this code:'), h('p', { class: 'bigcode mono' }, code), h('p', { class: 'dim small' }, 'or scan it with the phone that has your dashboard'), qrCanvas(PAGES + '#pair=' + code), state),
+      { class: 'door' },
+      h('div', { class: 'card center' }, h('p', null, 'On your dashboard choose "Add a machine", then "It shows a code", and enter:'), h('p', { class: 'bigcode mono' }, code), h('p', { class: 'dim small' }, 'or scan it with the phone that has your dashboard'), qrCanvas(PAGES + '#pair=' + code), state),
       h('p', null, h('button', { class: 'ghost small', onclick: () => showSetup() }, 'Back'))
     )
   );
@@ -280,6 +314,7 @@ async function showPairHere() {
 
 async function connect(s) {
   secret = s;
+  session.set(s);
   ctl = new Controller({
     mqttConnect: window.mqtt.connect,
     broker: s.broker || undefined,
@@ -295,19 +330,20 @@ async function connect(s) {
   if (pendingPair) {
     const code = pendingPair;
     pendingPair = null;
-    addMachine(code);
+    addMachine(code, true);
   }
 }
 
 // Tells the machine that is showing this one-time code which dashboard it belongs to.
-async function addMachine(input) {
+async function addMachine(input, fromLink = false) {
   let code;
   try {
     code = normalizePairCode(input);
   } catch (e) {
     return fail(e);
   }
-  if (!confirm(`Add the machine showing code ${code} to your dashboard?`)) return;
+  // A code typed here by hand needs no second question; one that arrived in a link does.
+  if (fromLink && !confirm(`Add the machine showing code ${code} to your dashboard?`)) return;
   toast('Looking for the machine…');
   try {
     const name = await pairOffer({ mqttConnect: window.mqtt.connect, broker: secret.broker || undefined, code, pub: ctl.pub });
@@ -329,115 +365,185 @@ const seenMachines = () => {
   }
 };
 
-let adding = false; // whether the "Add a machine" panel is open
+const OS = { windows: ['Win', 'Windows PC'], mac: ['Mac', 'Mac'], linux: ['Lin', 'Linux'], wsl: ['WSL', 'Linux on Windows'], android: ['And', 'Android'] };
 const cardList = h('div');
 
-// Redraws only the machine cards, so presence updates never disturb what the user is typing below them.
+// Redraws only the machine cards, so presence updates never disturb anything else on the screen.
 function drawCards() {
   const seen = seenMachines();
-  const cards = machines.map((m) =>
-    h(
+  const cards = machines.map((m) => {
+    const [short, kind] = OS[m.os] || [m.os.slice(0, 3), m.os];
+    return h(
       'button',
-      { class: 'card machine' + (m.online ? '' : ' offline'), onclick: () => openMachine(m) },
-      h('span', { class: 'dot ' + (m.online ? 'on' : 'off') }),
-      h('span', { class: 'grow' }, h('div', { class: 'name' }, m.name), h('div', { class: 'dim small' }, m.os + (m.host && m.host !== m.name ? ' · ' + m.host : '') + (m.online ? '' : ' · offline'))),
-      !seen.has(m.id) && h('span', { class: 'badge', title: 'You have not opened this machine on this device before' }, 'new')
-    )
-  );
-  cardList.replaceChildren(...(cards.length ? cards : [h('div', { class: 'empty' }, 'No machines yet. Choose "Add a machine" below.')]));
+      { class: 'machine' + (m.online ? '' : ' offline'), 'aria-label': `${m.name}, ${kind}, ${m.online ? 'online' : 'offline'}`, onclick: () => openMachine(m) },
+      h('span', { class: 'os', 'aria-hidden': 'true' }, short),
+      h('span', { class: 'grow' }, h('div', { class: 'name' }, m.name), h('div', { class: 'state' }, h('span', { class: 'dot ' + (m.online ? 'on' : 'off') }), (m.online ? 'Online' : 'Offline') + ', ' + kind + (m.host && m.host !== m.name ? ', ' + m.host : ''))),
+      !seen.has(m.id) && h('span', { class: 'badge', title: 'You have not opened this machine on this device before' }, 'new'),
+      h('span', { class: 'go', 'aria-hidden': 'true' }, '›')
+    );
+  });
+  cardList.replaceChildren(...(cards.length ? cards : [h('div', { class: 'empty' }, 'No machines yet. Add your first one below.')]));
 }
 
 function showMachines() {
   screen = 'machines';
   setHeader('My machines', false);
   drawCards();
-  const query = new URLSearchParams({ p: ctl.pub, ...(secret.broker ? { b: secret.broker } : {}) });
-  const names = { 'windows-x64': 'Windows', 'linux-x64': 'Linux', 'linux-arm64': 'Linux (ARM)' };
-  const codeInput = h('input', { class: 'mono', placeholder: 'XXXX-XXXX-XXXX', 'aria-label': 'Pairing code', autocapitalize: 'characters', autocomplete: 'off', spellcheck: 'false' });
-  const panel = h(
-    'div',
-    { hidden: !adding },
-    local &&
-      local.enrolled !== ctl.pub &&
-      h(
-        'p',
-        null,
-        h(
-          'button',
-          {
-            class: 'primary',
-            onclick: async () => {
-              try {
-                await api('enroll', { p: ctl.pub, b: secret.broker || '' });
-                await refreshLocal();
-                toast(`Added this computer ("${local.name}").`);
-                showMachines();
-              } catch (e) {
-                fail(e);
-              }
-            },
-          },
-          'Add this computer'
-        )
-      ),
-    h('h3', null, 'Another computer'),
-    local
-      ? h(
-          'div',
-          null,
-          h('p', { class: 'small' }, 'Download the client program, copy it to the other computer and run it there. The computer appears here by itself. A client program can only add its computer to this dashboard; it cannot open the dashboard or control anything.'),
-          h('div', { class: 'row wrap' }, local.targets.map((t) => h('a', { class: 'button', href: '/api/client?target=' + t + '&' + query, download: '' }, 'Client for ' + (names[t] || t))))
-        )
-      : h('p', { class: 'small' }, 'Client programs are made by the dashboard program on a computer: ', h('a', { href: 'https://github.com/antoniolox1721/reach/releases/latest', target: '_blank', rel: 'noopener noreferrer' }, 'get it here'), ', open your dashboard there and choose "Add a machine".'),
-    h('h3', null, 'A Mac, or Linux without a desktop'),
-    h('p', { class: 'small' }, 'Open Terminal on that machine, paste the line for it and press Enter. It appears here by itself and comes back whenever the machine starts.'),
-    ['macos-arm64', 'linux-x64', 'linux-arm64'].map((t) => {
-      const cmd = `curl -fsSL https://github.com/antoniolox1721/reach/releases/latest/download/reach-dashboard-${t} -o reach-setup && chmod +x reach-setup && ./reach-setup join ${ctl.pub}${secret.broker ? ' --broker ' + secret.broker : ''}; rm -f reach-setup`;
-      return h(
-        'div',
-        { class: 'cmdrow' },
-        h('div', { class: 'small dim' }, { 'macos-arm64': 'Mac (Apple silicon: M1 or newer)', 'linux-x64': 'Linux', 'linux-arm64': 'Linux (ARM, e.g. Raspberry Pi)' }[t]),
-        h('div', { class: 'row' }, h('div', { class: 'cmdbox mono grow' }, cmd), h('button', { type: 'button', onclick: () => navigator.clipboard.writeText(cmd).then(() => toast('Copied. Paste it in Terminal on that machine.'), () => toast('Select the text and copy it by hand.', true)) }, 'Copy'))
-      );
-    }),
-    h('h3', null, 'With a code'),
-    h('p', { class: 'small' }, 'For a phone, or a machine that is showing a pairing code: type the code here.'),
-    h(
-      'form',
-      {
-        class: 'row',
-        onsubmit: (e) => {
-          e.preventDefault();
-          addMachine(codeInput.value);
-        },
-      },
-      codeInput,
-      h('button', { class: 'primary', type: 'submit' }, 'Add')
-    ),
-    h('h3', null, 'Open this dashboard on my phone'),
-    h('p', { class: 'small' }, 'Shows a QR code to scan with your phone. It contains your dashboard key, so do not let anyone else see or photograph it.'),
-    h('p', null, h('button', { onclick: showPhoneLink }, 'Show QR code'))
-  );
   view.replaceChildren(
     h(
       'div',
       { class: 'pad' },
       cardList,
       h(
-        'div',
-        { class: 'card' },
-        h(
-          'button',
-          {
-            class: 'ghost',
-            onclick: () => {
-              adding = !adding;
-              panel.hidden = !adding;
-            },
+        'button',
+        {
+          class: 'primary wide',
+          onclick: () => {
+            history.pushState({ add: true }, '');
+            showAdd();
           },
-          '+ Add a machine'
+        },
+        'Add a machine'
+      )
+    )
+  );
+}
+
+const copyButton = (text, done) => h('button', { type: 'button', onclick: () => navigator.clipboard.writeText(text).then(() => toast(done), () => toast('Select the text and copy it by hand.', true)) }, 'Copy');
+
+// One question (what are you adding?), then only the steps for that answer.
+function showAdd() {
+  screen = 'add';
+  setHeader('Add a machine', true);
+  const broker = secret.broker || '';
+  const query = new URLSearchParams({ p: ctl.pub, ...(broker ? { b: broker } : {}) });
+  const download = (target, label) => h('a', { class: 'button primary', href: '/api/client?target=' + target + '&' + query, download: '' }, label);
+  const line = (target) => {
+    const cmd = joinCommand(target, ctl.pub, broker);
+    return h('div', { class: 'row cmdrow' }, h('div', { class: 'cmdbox mono' }, cmd), copyButton(cmd, 'Copied. Paste it in Terminal on that machine.'));
+  };
+  const needsProgram = () =>
+    h('p', null, 'Client programs are made by the dashboard program on a computer. ', h('a', { href: 'https://github.com/antoniolox1721/reach/releases/latest', target: '_blank', rel: 'noopener noreferrer' }, 'Get the dashboard program'), ', open your dashboard there and choose "Add a machine". If that machine already runs reach and shows a code, choose "It shows a code" instead.');
+  const codeInput = h('input', { id: 'code', class: 'mono', placeholder: 'XXXX-XXXX-XXXX', autocapitalize: 'characters', autocomplete: 'off', spellcheck: 'false' });
+  const all = [];
+  const choice = (short, title, sub, ...body) => {
+    const steps = h('div', { class: 'steps', hidden: true }, body);
+    const button = h(
+      'button',
+      {
+        class: 'choice',
+        'aria-expanded': 'false',
+        onclick: () => {
+          const open = button.getAttribute('aria-expanded') !== 'true';
+          for (const [b, s] of all) {
+            b.setAttribute('aria-expanded', 'false');
+            s.hidden = true;
+          }
+          button.setAttribute('aria-expanded', String(open));
+          steps.hidden = !open;
+          if (open) steps.querySelector('input')?.focus();
+        },
+      },
+      h('span', { class: 'os', 'aria-hidden': 'true' }, short),
+      h('span', { class: 'grow' }, h('b', null, title), h('span', { class: 'dim' }, sub))
+    );
+    all.push([button, steps]);
+    return [button, steps];
+  };
+  view.replaceChildren(
+    h(
+      'div',
+      { class: 'pad' },
+      h('p', null, 'What do you want to add?'),
+      h(
+        'div',
+        { class: 'choices' },
+        local &&
+          local.enrolled !== ctl.pub &&
+          choice(
+            'PC',
+            `This computer (${local.name})`,
+            'One click',
+            h('p', null, 'This computer is on your dashboard while the dashboard program is open.'),
+            h(
+              'button',
+              {
+                class: 'primary',
+                onclick: async () => {
+                  try {
+                    await api('enroll', { p: ctl.pub, b: broker });
+                    await refreshLocal();
+                    toast(`Added this computer ("${local.name}").`);
+                    history.back();
+                  } catch (e) {
+                    fail(e);
+                  }
+                },
+              },
+              'Add this computer'
+            )
+          ),
+        choice(
+          'Win',
+          'A Windows PC',
+          'Download one program and run it there',
+          local
+            ? h(
+                'ol',
+                null,
+                h('li', null, h('p', null, 'Download the client program.'), download('windows-x64', 'Download for Windows')),
+                h('li', null, 'Copy it to the other PC, for example on a USB stick or through a cloud folder.'),
+                h('li', null, 'Double-click it there. The PC appears on this dashboard by itself, and again every time it starts.')
+              )
+            : needsProgram(),
+          local && h('p', { class: 'small dim' }, 'The client program can only put its PC on this dashboard. It cannot open the dashboard or control anything. From then on it keeps itself up to date.')
         ),
-        panel
+        choice(
+          'Mac',
+          'A Mac',
+          'Paste one line in Terminal',
+          h(
+            'ol',
+            null,
+            h('li', null, 'On the Mac, open Terminal: press Command and Space, type Terminal, press Return.'),
+            h('li', null, h('p', null, 'Paste this line there and press Return.'), line('macos-arm64')),
+            h('li', null, 'The Mac appears on this dashboard by itself, and again every time it starts. Terminal then shows one more step that stops the Mac from asking for permission on its screen later.')
+          ),
+          h('p', { class: 'small dim' }, 'For Macs with Apple silicon (M1 or newer).')
+        ),
+        choice(
+          'Lin',
+          'A Linux machine',
+          'Paste one line in a terminal',
+          h('ol', null, h('li', null, h('p', null, 'Open a terminal on that machine, paste this line and press Enter.'), line('linux-x64')), h('li', null, 'The machine appears on this dashboard by itself, and again every time it starts.')),
+          h('p', { class: 'small' }, 'On an ARM machine such as a Raspberry Pi, use this line instead:'),
+          line('linux-arm64'),
+          local && h('p', { class: 'small' }, 'Or download a client program to copy over and run: '),
+          local && h('div', { class: 'row wrap' }, h('a', { class: 'button', href: '/api/client?target=linux-x64&' + query, download: '' }, 'Linux'), h('a', { class: 'button', href: '/api/client?target=linux-arm64&' + query, download: '' }, 'Linux (ARM)'))
+        ),
+        choice(
+          '123',
+          'It shows a code',
+          'A phone, or a machine where you ran "reach pair"',
+          h(
+            'form',
+            {
+              onsubmit: (e) => {
+                e.preventDefault();
+                addMachine(codeInput.value);
+              },
+            },
+            h('label', { for: 'code' }, 'The code on that machine'),
+            h('div', { class: 'row' }, codeInput, h('button', { class: 'primary', type: 'submit' }, 'Add'))
+          )
+        ),
+        choice(
+          'QR',
+          'Open this dashboard on my phone',
+          'Scan a code with the phone',
+          h('p', null, 'The code contains your dashboard key. Do not let anyone else see or photograph it.'),
+          h('button', { onclick: showPhoneLink }, 'Show the code')
+        )
       )
     )
   );
@@ -445,20 +551,27 @@ function showMachines() {
 
 function showPhoneLink() {
   const link = PAGES + '#' + new URLSearchParams({ k: secret.key, ...(secret.broker ? { b: secret.broker } : {}) });
-  const close = () => overlay.remove();
+  const before = document.activeElement;
+  const close = () => {
+    overlay.remove();
+    before?.focus?.();
+  };
+  const done = h('button', { class: 'primary', onclick: close }, 'Done');
   const overlay = h(
     'div',
-    { class: 'overlay', onclick: (e) => e.target === overlay && close() },
-    h('div', { class: 'sheet center' }, h('h2', null, 'Scan with your phone'), qrCanvas(link), h('p', { class: 'small' }, 'Your phone opens the dashboard and asks you to choose a password for it. This code is your dashboard key: close this when you are done.'), h('button', { class: 'primary', onclick: close }, 'Done'))
+    { class: 'overlay', onclick: (e) => e.target === overlay && close(), onkeydown: (e) => e.key === 'Escape' && close() },
+    h('div', { class: 'sheet center', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Scan with your phone' }, h('h2', null, 'Scan with your phone'), qrCanvas(link), h('p', { class: 'small' }, 'Your phone opens the dashboard and asks you to choose a password for it. This code is your dashboard key: close this when you are done.'), done)
   );
   document.body.append(overlay);
+  done.focus();
 }
 
 async function openMachine(m) {
   try {
+    if (!m.online) return toast(`${m.name} is offline. It comes back by itself when it is switched on and connected.`, true);
     const seen = seenMachines();
-    if (!seen.has(m.id) && seen.size && !confirm(`"${m.name}" is new on this dashboard. Open it only if it is a machine you added yourself.`)) return;
     const info = await ctl.info(m.id);
+    autoUpdate(m, info).catch(() => {});
     localStorage.setItem('reach.seen', JSON.stringify([...seen.add(m.id)]));
     current = { id: m.id, name: m.name, info, tab: 'files', files: { path: info.home }, term: newTerm(info.home) };
     history.pushState({ machine: m.id }, '');
@@ -466,6 +579,34 @@ async function openMachine(m) {
   } catch (e) {
     fail(e);
   }
+}
+
+// The newest release, asked once per visit.
+let latest;
+const latestRelease = () =>
+  (latest ??= fetch('https://api.github.com/repos/antoniolox1721/reach/releases/latest', { headers: { accept: 'application/vnd.github+json' } })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => /^v(\d+\.\d+\.\d+)$/.exec(j?.tag_name || '')?.[1] || null)
+    .catch(() => null));
+
+// Opening a machine that is behind the newest release brings it up to date, once per visit. Newer clients do
+// it themselves when asked; older ones on a Mac or Linux are sent the install line through their terminal.
+async function autoUpdate(m, info) {
+  const version = await latestRelease();
+  if (!version || !info.version || !newer(version, info.version)) return;
+  const key = `reach.updated.${m.id}.${version}`;
+  try {
+    if (sessionStorage.getItem(key)) return;
+    sessionStorage.setItem(key, '1');
+  } catch {}
+  if (!newer('0.4.0', info.version)) {
+    await ctl.call(m.id, 'update');
+    return toast(`${m.name} is updating itself to version ${version}.`);
+  }
+  const target = targetOf(info);
+  if (!target) return toast(`${m.name} runs an older version (${info.version}). Run the new client program on it once; from then on it updates by itself.`);
+  await ctl.call(m.id, 'exec', { cmd: updateCommand(target, ctl.pub, secret.broker || ''), cwd: info.home });
+  toast(`Updating ${m.name} to version ${version}. It comes back in a moment.`);
 }
 
 function closeMachine() {
@@ -482,7 +623,8 @@ function showMachine() {
     h(
       'button',
       {
-        class: current.tab === t ? 'active' : '',
+        role: 'tab',
+        'aria-selected': String(current.tab === t),
         onclick: () => {
           current.tab = t;
           showMachine();
@@ -491,7 +633,10 @@ function showMachine() {
       t[0].toUpperCase() + t.slice(1)
     )
   );
-  view.replaceChildren(h('div', { class: 'tabs' }, tabs), body);
+  const notice =
+    current.info.fda === false &&
+    h('div', { class: 'notice small' }, 'This Mac asks on its own screen before reach may open Desktop, Documents, Downloads or external disks, and waits there for an answer. To stop that for good, once at the Mac: System Settings › Privacy & Security › Full Disk Access › add ', h('code', null, '~/.reach/bin/reach'), ', then restart the Mac.');
+  view.replaceChildren(h('div', { class: 'tabs', role: 'tablist' }, tabs), notice || '', body);
   ({ files: renderFiles, terminal: renderTerminal, scripts: renderScripts })[current.tab](body);
 }
 
@@ -525,7 +670,7 @@ async function renderFiles(body) {
     ),
     h(
       'div',
-      { class: 'bar' },
+      { class: 'bar wrap' },
       h('button', { onclick: () => f.parent && go(f.parent) }, '↑ Up'),
       h('button', { onclick: () => go(me.info.home) }, 'Home'),
       me.info.roots.map((r) => h('button', { onclick: () => go(r) }, r)),
@@ -557,9 +702,13 @@ async function renderFiles(body) {
     const rows = r.entries.map((e) =>
       h(
         'div',
-        { class: 'entry' + (e.d ? ' dir' : ''), onclick: () => (e.d ? go(joinPath(r.path, e.n)) : fileSheet(e, r.path, go)) },
-        h('span', { class: 'glyph' }, e.d ? '▸' : '·'),
-        h('span', { class: 'grow' }, h('div', { class: 'n' }, e.n), h('div', { class: 'meta' }, (e.d ? 'folder' : fmtSize(e.s)) + (e.m ? ' · ' + fmtDate(e.m) : ''))),
+        { class: 'entry' + (e.d ? ' dir' : '') },
+        h(
+          'button',
+          { class: 'open', onclick: () => (e.d ? go(joinPath(r.path, e.n)) : fileSheet(e, r.path, go)) },
+          h('span', { class: 'glyph', 'aria-hidden': 'true' }, e.d ? '▸' : '·'),
+          h('span', { class: 'grow' }, h('span', { class: 'n' }, e.n), h('span', { class: 'meta' }, (e.d ? 'folder' : fmtSize(e.s)) + (e.m ? ' · ' + fmtDate(e.m) : '')))
+        ),
         h(
           'button',
           {
@@ -582,13 +731,17 @@ async function renderFiles(body) {
 }
 
 function sheet(title, actions) {
-  const close = () => overlay.remove();
+  const before = document.activeElement;
+  const close = () => {
+    overlay.remove();
+    before?.focus?.();
+  };
   const overlay = h(
     'div',
-    { class: 'overlay', onclick: (e) => e.target === overlay && close() },
+    { class: 'overlay', onclick: (e) => e.target === overlay && close(), onkeydown: (e) => e.key === 'Escape' && close() },
     h(
       'div',
-      { class: 'sheet' },
+      { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
       h('h2', null, title),
       actions.filter(Boolean).map(([label, fn, cls]) =>
         h(
@@ -607,6 +760,7 @@ function sheet(title, actions) {
     )
   );
   document.body.append(overlay);
+  overlay.querySelector('button')?.focus();
 }
 
 function fileSheet(e, dir, go) {
@@ -852,7 +1006,11 @@ async function openFile(e, full, refresh) {
     content = h('textarea', { spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off' });
     content.value = text;
   }
-  const close = () => full_.remove();
+  const before = document.activeElement;
+  const close = () => {
+    full_.remove();
+    before?.focus?.();
+  };
   const save = h(
     'button',
     {
@@ -873,8 +1031,10 @@ async function openFile(e, full, refresh) {
     },
     'Save'
   );
-  const full_ = h('div', { class: 'full' }, h('header', null, h('h1', null, e.n), save, h('button', { onclick: close }, 'Close')), content);
+  const closeButton = h('button', { onclick: close }, 'Close');
+  const full_ = h('div', { class: 'full', role: 'dialog', 'aria-modal': 'true', 'aria-label': e.n, onkeydown: (ev) => ev.key === 'Escape' && content.tagName !== 'TEXTAREA' && close() }, h('header', null, h('h1', null, e.n), save, closeButton), content);
   document.body.append(full_);
+  closeButton.focus();
 }
 
 async function uploadFiles(files, f, refresh) {
@@ -897,7 +1057,7 @@ async function uploadFiles(files, f, refresh) {
 // ---------- terminal ----------
 
 function newTerm(cwd) {
-  return { cwd, log: h('pre', { class: 'term' }), job: null, unwatch: null, next: 0, decoder: null, chars: 0, history: [], hpos: 0, onchange: null };
+  return { cwd, log: h('pre', { class: 'term' }), job: null, pty: false, busy: Promise.resolve(), unwatch: null, next: 0, decoder: null, chars: 0, history: [], hpos: 0, onchange: null };
 }
 
 function termWrite(t, text, cls) {
@@ -921,9 +1081,10 @@ const cleanOutput = (s) =>
     .replace(/[^\n]*\r/g, '');
 
 // Follows a job's output. Offsets make it safe to combine the live stream with a catch-up 'tail'.
-async function attach(t, agent, job, from) {
+async function attach(t, agent, job, from, pty = false) {
   t.unwatch?.();
   t.job = job;
+  t.pty = pty;
   t.next = from;
   t.decoder = new TextDecoder();
   let exited = false;
@@ -979,7 +1140,7 @@ async function runCommand(t, cmd) {
       t.onchange?.();
     } else {
       const { r } = await ctl.call(agent, 'exec', { cmd, cwd: t.cwd });
-      await attach(t, agent, r.job, 0);
+      await attach(t, agent, r.job, 0, !!r.pty);
     }
   } catch (e) {
     termWrite(t, e.message + '\n', 'note');
@@ -994,6 +1155,9 @@ function renderTerminal(body) {
   const input = h('input', { 'aria-label': 'Command', autocapitalize: 'off', autocomplete: 'off', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'send' });
   const send = h('button', { class: 'primary', type: 'submit' });
   const stop = h('button', { class: 'danger', type: 'button', onclick: () => t.job && call('kill', { job: t.job }).catch(fail) }, 'Stop');
+  // Only a program running in a real terminal understands Ctrl+C; it interrupts what runs inside without ending the session.
+  const prev = h('button', { type: 'button', 'aria-label': 'Previous command', onclick: () => recall(-1) }, '↑');
+  const ctrlC = h('button', { type: 'button', title: 'Interrupt (Ctrl+C)', onclick: () => t.job && call('stdin', { job: t.job }, te.encode('\x03')).catch(fail) }, '^C');
   const recall = (d) => {
     if (!t.history.length) return;
     t.hpos = Math.max(0, Math.min(t.history.length, t.hpos + d));
@@ -1023,7 +1187,7 @@ function renderTerminal(body) {
                 t.log.replaceChildren();
                 t.chars = 0;
                 termWrite(t, `${j.cwd} $ ${j.cmd}\n`, 'prompt');
-                attach(t, me.id, j.job, null);
+                attach(t, me.id, j.job, null, !!j.pty);
               },
             },
             (j.running ? '● ' : '') + j.cmd
@@ -1036,6 +1200,8 @@ function renderTerminal(body) {
     cwd.textContent = t.job ? 'Running. Type to send input to the program.' : t.cwd;
     send.textContent = t.job ? 'Send' : 'Run';
     stop.hidden = !t.job;
+    ctrlC.hidden = !t.job || !t.pty;
+    prev.hidden = !!t.job;
     input.placeholder = t.job ? 'input for the running program' : 'command';
     if (current === me && me.tab === 'terminal') loadJobs();
   };
@@ -1052,16 +1218,21 @@ function renderTerminal(body) {
           e.preventDefault();
           const v = input.value;
           input.value = '';
-          if (t.job) {
-            termWrite(t, v + '\n', 'prompt');
-            call('stdin', { job: t.job }, te.encode(v + '\n')).catch(fail);
-          } else {
-            runCommand(t, v);
-          }
+          // Wait until the machine has confirmed the previous line: what is typed meanwhile may be input for
+          // the program that is just starting, not a new command.
+          t.busy = t.busy
+            .then(() => {
+              if (!t.job) return runCommand(t, v);
+              // A real terminal shows what is typed by itself (and hides passwords).
+              if (!t.pty) termWrite(t, v + '\n', 'prompt');
+              return ctl.call(me.id, 'stdin', { job: t.job }, te.encode(v + '\n'));
+            })
+            .catch(fail);
         },
       },
-      h('button', { type: 'button', 'aria-label': 'Previous command', onclick: () => recall(-1) }, '↑'),
+      prev,
       input,
+      ctrlC,
       stop,
       send
     )
@@ -1139,7 +1310,7 @@ async function renderScripts(body) {
                   if (s.cwd) me.term.cwd = s.cwd;
                   me.tab = 'terminal';
                   showMachine();
-                  runCommand(me.term, s.cmd);
+                  me.term.busy = me.term.busy.then(() => runCommand(me.term, s.cmd));
                 },
               },
               '▶ Run'
@@ -1189,7 +1360,7 @@ async function boot() {
   if (fromLink?.secret) showSetup('import', fromLink);
   else if (local?.pending && claimToken) showSetup('claim');
   else if (local?.pending) view.replaceChildren(h('div', { class: 'pad' }, h('div', { class: 'card' }, 'Your dashboard is prepared but not set up yet. To finish, open it from the reach program: start the dashboard program again, or click the reach icon next to the clock.')));
-  else if (localStorage.getItem(VAULT)) showUnlock();
+  else if (localStorage.getItem(VAULT)) session.get()?.key ? connect(session.get()).catch(showUnlock) : showUnlock();
   else {
     if (pendingPair) toast('Open your dashboard on this device first, then scan the code again.', true);
     pendingPair = null;
